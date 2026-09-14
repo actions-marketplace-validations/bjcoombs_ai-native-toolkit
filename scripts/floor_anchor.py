@@ -4,7 +4,7 @@
 The floor markers and clause checks only bite while ``floor.yml`` is a *required*
 status check. A settings change that drops it silently disarms the whole floor.
 This script closes that gap: it queries the live GitHub API on every run and
-HARD-FAILS (fail-closed) unless BOTH of these hold:
+HARD-FAILS (fail-closed) unless ALL THREE of these hold:
 
   1. both floor status checks (``floor enforcement`` and ``floor self-anchor``)
      are still required on the default branch,
@@ -15,9 +15,12 @@ HARD-FAILS (fail-closed) unless BOTH of these hold:
      the checked-out ``floor.yml`` still wires that environment into a job the
      ``floor enforcement`` job needs. Either half alone is decorative -- an
      environment nothing references never asks for a review, and a job pointing
-     at an environment with no required reviewer approves itself.
+     at an environment with no required reviewer approves itself. The wiring
+     check also pins the TRIGGER: the sign-off job's ``if:`` must be exactly
+     the path filter's ``floor_core_changed == 'true'`` answer, and ``floor
+     enforcement`` must turn both a refused and a never-requested review red.
 
-These two are fail-CLOSED: any inability to confirm them (missing token,
+These three are fail-CLOSED: any inability to confirm them (missing token,
 insufficient permissions) is a failure, never a pass. Reading branch protection
 and rulesets requires admin:read, which the default Actions ``GITHUB_TOKEN``
 does not carry -- provide a fine-grained PAT with "Administration: read" as the
@@ -28,7 +31,7 @@ The floor.yml *path lock* (a push ruleset with ``file_path_restriction``) that a
 third check once required is DESCOPED -- see ``PATH_LOCK_DESCOPED`` below. GitHub
 refuses push rulesets on public, user-owned repos, so it is a documented
 capability gap that this script WARNS about (loudly, non-failing) rather than
-enforcing. The two requirements above remain fail-closed.
+enforcing. The three requirements above remain fail-closed.
 
 Stdlib only.
 """
@@ -83,6 +86,66 @@ BLOCK_LIST_ITEM_RE = re.compile(r"^\s{6}-\s*(.+?)\s*$")
 # job guard must NOT mention the sign-off result and a step guard MUST.
 JOB_IF_RE = re.compile(r"^\s{4}if:\s*(.+?)\s*$")
 STEP_IF_RE = re.compile(r"^\s{6,}if:\s*(.+?)\s*$")
+# The one shape the sign-off job's guard may take: the path filter's
+# floor-core answer, compared to 'true', and nothing else. The output name is
+# the contract between the filter step and this anchor; the filter job's id is
+# captured so the anchor can confirm the sign-off job actually ``needs`` it
+# (an output read from a job outside ``needs`` is silently empty, which would
+# skip the review on every PR).
+FLOOR_CORE_OUTPUT = "floor_core_changed"
+SIGNOFF_TRIGGER_RE = re.compile(
+    r"^needs\.([A-Za-z0-9_-]+)\.outputs\." + FLOOR_CORE_OUTPUT + r"\s*==\s*['\"]true['\"]$"
+)
+# The one shape the never-requested step's guard may take: the same filter
+# answer, conjoined with the sign-off job's result being anything but success.
+# Pinned exactly, like the trigger, so a crafted guard cannot satisfy a looser
+# substring test while no-op'ing the step for a chosen actor or branch.
+NEVER_REQUESTED_RE = re.compile(
+    r"^needs\.([A-Za-z0-9_-]+)\.outputs\." + FLOOR_CORE_OUTPUT
+    + r"\s*==\s*['\"]true['\"]\s*&&\s*"
+    r"needs\.([A-Za-z0-9_-]+)\.result\s*!=\s*['\"]success['\"]$"
+)
+# The other two conversion steps' guards, pinned the same way: a refused review
+# (the sign-off job's result is 'failure') and a path filter that did not run
+# to success (so no sign-off could have been requested at all).
+REFUSED_RE = re.compile(
+    r"^needs\.([A-Za-z0-9_-]+)\.result\s*==\s*['\"]failure['\"]$"
+)
+UNCLASSIFIED_RE = re.compile(
+    r"^needs\.([A-Za-z0-9_-]+)\.result\s*!=\s*['\"]success['\"]$"
+)
+# The one shape the enforcement job's own guard may take. Anything else -- a
+# ``needs.<job>.result`` conjunct, a branch test, no guard at all -- lets the
+# required context SKIP on some path, and branch protection reads a skipped
+# required context as satisfied.
+ENFORCEMENT_GUARD = "!cancelled()"
+# The filter job must PRODUCE the output the guards read: a job-level
+# ``outputs:`` entry at six spaces, with a value. Without it the consumers'
+# ``needs.<filter>.outputs.floor_core_changed`` is empty on every run.
+JOB_OUTPUTS_KEY_RE = re.compile(r"^\s{4}outputs:\s*$")
+# The output must be the expression that forwards a STEP's output -- a literal
+# ('false', say) would answer every PR without asking the script -- and that
+# step must be the one that runs the classification: floor_check.py, asked for
+# the floor-core role. The anchor cannot judge the script's answer; it can pin
+# that the answer comes from the script.
+JOB_OUTPUT_RE = re.compile(
+    r"^\s{6}" + FLOOR_CORE_OUTPUT
+    + r":\s*\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\." + FLOOR_CORE_OUTPUT
+    + r"\s*\}\}\s*$"
+)
+STEP_ID_RE = re.compile(r"^\s{6,}id:\s*(\S+)\s*$")
+CLASSIFIER_INVOCATION = ("floor_check.py protected", "--role floor-core")
+# ``continue-on-error: true`` at step or job level makes a non-zero exit
+# non-fatal, which disarms every conversion step while leaving each guard and
+# script byte-identical. The key is rejected outright in the enforcement job.
+CONTINUE_ON_ERROR_RE = re.compile(r"^\s+continue-on-error:(?!\s*false\s*$)")
+# A step's shape inside a job: steps start with ``- `` at six spaces, and a
+# ``run:`` inside one is either inline or a ``|``/``>`` block whose body sits
+# deeper than the key. A conversion step must actually exit non-zero -- a guard
+# that fires into ``run: true`` converts nothing -- so its script is read too.
+STEP_START_RE = re.compile(r"^\s{4,}-\s+[A-Za-z_-]+:")
+STEP_RUN_RE = re.compile(r"^(\s{6,})run:\s*(.*?)\s*$")
+EXIT_NONZERO_RE = re.compile(r"^\s*exit\s+[1-9]\d*\s*$", re.MULTILINE)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # --- E2 DESCOPE: floor.yml path lock (maintainer decision, 2026-07-10) --------
@@ -101,8 +164,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # explicit, cited decision -- not a silent removal -- so the gap stays legible.
 # The self-anchor therefore treats the missing path restriction as a DOCUMENTED
 # capability gap: it WARNS loudly (stderr + job summary) instead of failing. The
-# two hard requirements (both floor checks required + branch protection readable)
-# stay fail-closed.
+# three hard requirements (both floor checks required + branch protection
+# readable + clause iii's sign-off environment present and wired) stay
+# fail-closed.
 PATH_LOCK_DESCOPED = True
 PATH_LOCK_DESCOPE_DATE = "2026-07-10"
 PATH_LOCK_DESCOPE_EVIDENCE = (
@@ -621,12 +685,178 @@ def check_workflow_wiring(root: Path | None = None) -> None:
             "context does not depend on cannot turn a refusal red, and branch "
             "protection reads an absent context as satisfied."
         )
-    _check_refusal_is_red(jobs, enforcement, env_jobs, env)
+    filter_job = _check_signoff_trigger(jobs, env_jobs, env)
+    _check_refusal_is_red(jobs, enforcement, env_jobs, env, filter_job)
     print(
         f"ok   {FLOOR_PATH} wires the {env!r} environment into job "
-        f"{wired[0]!r}, which the {FLOOR_CONTEXT!r} job needs, and turns a "
-        "refused review into a red required context."
+        f"{wired[0]!r}, which the {FLOOR_CONTEXT!r} job needs; the job is "
+        f"keyed on the path filter's {FLOOR_CORE_OUTPUT!r} answer alone, and "
+        "a refused or never-requested review lands as a red required context."
     )
+
+
+def _strip_expression(expr: str) -> str:
+    """``${{ x }}`` and bare ``x`` are the same guard to GitHub; compare ``x``."""
+    expr = re.sub(r"\s+#.*$", "", expr.strip())  # a trailing YAML comment
+    if expr.startswith("${{") and expr.endswith("}}"):
+        expr = expr[3:-2]
+    return expr.strip()
+
+
+def _check_signoff_trigger(
+    jobs: dict[str, list[str]], env_jobs: set[str], env: str
+) -> str:
+    """Fail unless the sign-off job is keyed on the path filter's answer alone.
+
+    Returns the filter job's id, so the enforcement job's steps can be held
+    to the SAME filter: two jobs answering the same question is how a decoy
+    that always says ``false`` would slip in.
+
+    The environment, the ``needs`` edge and the refusal step all survive a PR
+    that edits the sign-off job's ``if:`` -- to a different output, to an extra
+    conjunct, or to nothing at all -- while the review is either skipped on the
+    PRs it exists for or requested on every PR. The trigger is the script's
+    classification (FLOOR.md clause iii names the floor core), so the guard is
+    pinned to that one expression, and the filter job it reads from must be in
+    the sign-off job's ``needs`` or the output is silently empty.
+    """
+    filters: set[str] = set()
+    for job_id in sorted(env_jobs):
+        lines = jobs[job_id]
+        guards = [m.group(1) for line in lines if (m := JOB_IF_RE.match(line))]
+        if not guards:
+            raise AnchorError(
+                f"the {env!r} sign-off job {job_id!r} has no job-level `if:`, "
+                "so a deployment review is requested on EVERY pull request "
+                "rather than on a floor-core change. The guard must be "
+                f"`needs.<filter job>.outputs.{FLOOR_CORE_OUTPUT} == 'true'`."
+            )
+        expr = _strip_expression(guards[0])
+        match = SIGNOFF_TRIGGER_RE.match(expr)
+        if not match:
+            raise AnchorError(
+                f"the {env!r} sign-off job {job_id!r} is guarded by "
+                f"{guards[0]!r}, not by the path filter's "
+                f"`{FLOOR_CORE_OUTPUT} == 'true'` answer alone. Any other "
+                "trigger re-decides which changes need the maintainer's review "
+                "inside the pull request under review (FLOOR.md clause iii), "
+                "so the guard must be exactly "
+                f"`needs.<filter job>.outputs.{FLOOR_CORE_OUTPUT} == 'true'`."
+            )
+        _check_reads_filter(jobs, job_id, match.group(1), f"the {env!r} sign-off job")
+        filters.add(match.group(1))
+    if len(filters) != 1:
+        raise AnchorError(
+            f"the {env!r} sign-off jobs read {FLOOR_CORE_OUTPUT!r} from "
+            f"different filter jobs ({sorted(filters)}). One classification, "
+            "one producer."
+        )
+    return filters.pop()
+
+
+def _check_reads_filter(
+    jobs: dict[str, list[str]], job_id: str, filter_job: str, what: str
+) -> None:
+    """Fail unless ``job_id`` can actually read the filter job it names.
+
+    GitHub evaluates ``needs.<job>.outputs.*`` for a job outside ``needs`` (or
+    one that does not exist) as empty, never as an error, so the comparison
+    to ``'true'`` is quietly false on every pull request.
+    """
+    if filter_job not in jobs:
+        raise AnchorError(
+            f"{what} {job_id!r} reads `needs.{filter_job}.outputs."
+            f"{FLOOR_CORE_OUTPUT}` but no job {filter_job!r} exists in "
+            f"{FLOOR_PATH}. The output is empty on every pull request, so the "
+            "guard is never true."
+        )
+    if filter_job not in _job_needs(jobs[job_id]):
+        raise AnchorError(
+            f"{what} {job_id!r} reads `needs.{filter_job}.outputs."
+            f"{FLOOR_CORE_OUTPUT}` but does not list {filter_job!r} in "
+            "`needs:`. GitHub evaluates an output from a job outside `needs` "
+            "as empty, so the guard is never true."
+        )
+    outputs = [
+        m for line in _job_outputs(jobs[filter_job]) if (m := JOB_OUTPUT_RE.match(line))
+    ]
+    if not outputs:
+        raise AnchorError(
+            f"{what} {job_id!r} reads `needs.{filter_job}.outputs."
+            f"{FLOOR_CORE_OUTPUT}` but job {filter_job!r} declares no "
+            f"`{FLOOR_CORE_OUTPUT}: ${{{{ steps.<id>.outputs.{FLOOR_CORE_OUTPUT} }}}}` "
+            "under `outputs:`. An output the producer never sets is empty on "
+            "every run, and a literal answers every run without asking the "
+            "script; either way the review is never requested."
+        )
+    step_id = outputs[0].group(1)
+    producer = [
+        step
+        for step in _job_steps(jobs[filter_job])
+        if any((m := STEP_ID_RE.match(line)) and m.group(1) == step_id for line in step)
+    ]
+    script = _step_run(producer[0]) if producer else ""
+    if not all(token in script for token in CLASSIFIER_INVOCATION):
+        raise AnchorError(
+            f"job {filter_job!r} forwards `steps.{step_id}.outputs."
+            f"{FLOOR_CORE_OUTPUT}` but step {step_id!r} does not run "
+            f"`{CLASSIFIER_INVOCATION[0]} ... {CLASSIFIER_INVOCATION[1]}` "
+            f"({'no such step' if not producer else 'its script never invokes it'}). "
+            "The floor-core answer has to come from the script's classification "
+            "(FLOOR.md clause iii), not from a step that decides on its own."
+        )
+
+
+def _job_steps(lines: list[str]) -> list[list[str]]:
+    """Split a job's lines into its steps (the lines before the first are dropped)."""
+    steps: list[list[str]] = []
+    for line in lines:
+        if STEP_START_RE.match(line):
+            steps.append([line])
+        elif steps:
+            steps[-1].append(line)
+    return steps
+
+
+def _step_guard(step: list[str]) -> str | None:
+    """The step's ``if:`` expression, unwrapped, or None when it has none."""
+    for line in step:
+        if m := STEP_IF_RE.match(line):
+            return _strip_expression(m.group(1))
+    return None
+
+
+def _step_run(step: list[str]) -> str:
+    """The step's ``run:`` script, inline or block, or '' when it has none."""
+    for index, line in enumerate(step):
+        m = STEP_RUN_RE.match(line)
+        if not m:
+            continue
+        indent, value = len(m.group(1)), m.group(2)
+        if value and value not in ("|", ">", "|-", ">-", "|+", ">+"):
+            return value
+        body: list[str] = []
+        for follow in step[index + 1:]:
+            if follow.strip() and len(follow) - len(follow.lstrip()) <= indent:
+                break
+            body.append(follow)
+        return "\n".join(body)
+    return ""
+
+
+def _job_outputs(lines: list[str]) -> list[str]:
+    """The lines of a job's ``outputs:`` block (six-space entries under the key)."""
+    block: list[str] = []
+    inside = False
+    for line in lines:
+        if JOB_OUTPUTS_KEY_RE.match(line):
+            inside = True
+            continue
+        if inside:
+            if line.strip() and not line.startswith(" " * 6):
+                break
+            block.append(line)
+    return block
 
 
 def _check_refusal_is_red(
@@ -634,46 +864,104 @@ def _check_refusal_is_red(
     enforcement: list[str],
     env_jobs: set[str],
     env: str,
+    signoff_filter: str,
 ) -> None:
-    """Fail unless a refusal still lands as RED rather than as an absent check.
+    """Fail unless every way the sign-off can lapse still lands as RED.
 
-    Wiring alone is not the guarantee: with the refusal step deleted, or with a
-    ``needs.<signoff>.result != 'failure'`` conjunct added to the job guard, the
-    environment, the ``needs`` edge and this anchor all stay exactly as they
-    are while a refused review becomes a no-op (the job passes) or an absent
-    context (the job skips, and branch protection reads a skipped required
-    context as satisfied). That conversion is the half the sign-off rests on,
-    so it is asserted here rather than left to review.
+    Wiring alone is not the guarantee: with a conversion step deleted, its
+    guard loosened, its script hollowed to ``run: true``, or a
+    ``needs.<job>.result`` conjunct added to the job guard, the environment,
+    the ``needs`` edge and this anchor all stay exactly as they are while a
+    refused, never-requested or never-classified review becomes a no-op (the
+    job passes) or an absent context (the job skips, and branch protection
+    reads a skipped required context as satisfied). That conversion is the
+    half the sign-off rests on, so all three steps are pinned here -- guard
+    AND script -- rather than left to review.
     """
-    def mentions_signoff(expr: str) -> bool:
-        return any(f"needs.{jid}.result" in expr for jid in env_jobs)
-
+    # The key is fatal in the enforcement job (a non-zero exit stops being
+    # one) and in the jobs it reads: a job with `continue-on-error: true`
+    # reports `result: success` to `needs` even when it failed, so a refused
+    # review or a broken filter would arrive here looking approved.
+    for job_id in sorted(set(enforcement) | env_jobs | {signoff_filter}):
+        for line in jobs.get(job_id, []):
+            if CONTINUE_ON_ERROR_RE.match(line):
+                raise AnchorError(
+                    f"job {job_id!r} carries `{line.strip()}`. "
+                    "`continue-on-error` makes a failure non-fatal -- in the "
+                    f"{FLOOR_CONTEXT!r} job a conversion step's `exit 1` no "
+                    "longer fails it, and in a job it reads the result arrives "
+                    "as 'success' even after a refusal or a failed filter. The "
+                    "key is not allowed in any of these jobs."
+                )
     for job_id in enforcement:
         lines = jobs[job_id]
-        for line in lines:
-            match = JOB_IF_RE.match(line)
-            if match and mentions_signoff(match.group(1)):
-                raise AnchorError(
-                    f"the {FLOOR_CONTEXT!r} job's `if:` guard references the "
-                    f"sign-off job's result ({match.group(1)!r}). A result "
-                    "conjunct makes this required context SKIP on a refused "
-                    "review, and branch protection reads a skipped required "
-                    "context as satisfied -- the refusal has to make it red, "
-                    "not absent. The guard must be `${{ !cancelled() }}` alone."
-                )
-        guarded = any(
-            (m := STEP_IF_RE.match(line))
-            and mentions_signoff(m.group(1))
-            and "failure" in m.group(1)
-            for line in lines
-        )
-        if not guarded:
+        guards = [m.group(1) for line in lines if (m := JOB_IF_RE.match(line))]
+        if not guards or _strip_expression(guards[0]) != ENFORCEMENT_GUARD:
+            seen = guards[0] if guards else "no `if:` at all"
             raise AnchorError(
-                f"no step of the {FLOOR_CONTEXT!r} job guards on the {env!r} "
-                "sign-off job's result being 'failure'. Without it a refused "
-                "review fails only the sign-off job, this required context "
-                "still goes green, and clause iii's approval is advisory."
+                f"the {FLOOR_CONTEXT!r} job's guard is {seen!r}, not "
+                f"`${{{{ {ENFORCEMENT_GUARD} }}}}` alone. The default guard "
+                "and any `needs.<job>.result` conjunct make this required "
+                "context SKIP when a needed job fails or is skipped -- a "
+                "refused review, or a path filter that never ran -- and branch "
+                "protection reads a skipped required context as satisfied. "
+                "Every such outcome has to arrive here as red, not absent."
             )
+        steps = [
+            (guard, _step_run(step))
+            for step in _job_steps(lines)
+            if (guard := _step_guard(step)) is not None
+        ]
+
+        def pinned(pattern: re.Pattern[str], accept, what: str, why: str) -> str:
+            """The captured job id of the one step whose guard is exactly
+            ``pattern`` and ``accept``-able, provided its script carries a
+            line that is an ``exit <n>`` with n > 0 (the shape the real steps
+            use; the anchor reads the line, it does not run the script)."""
+            for guard, run in steps:
+                m = pattern.match(guard)
+                if not m or not accept(m):
+                    continue
+                if not EXIT_NONZERO_RE.search(run):
+                    raise AnchorError(
+                        f"the {FLOOR_CONTEXT!r} step guarded by {guard!r} "
+                        f"runs {run.strip()!r}, which never exits non-zero. "
+                        f"A guard that fires into a passing script converts "
+                        f"nothing: {why}"
+                    )
+                return m.group(1)
+            raise AnchorError(
+                f"no step of the {FLOOR_CONTEXT!r} job is guarded by exactly "
+                f"`{what}`. {why} A looser guard is not accepted: a conjunct "
+                "that exempts an actor or a branch makes the step a no-op."
+            )
+
+        pinned(
+            REFUSED_RE,
+            lambda m: m.group(1) in env_jobs,
+            "needs.<sign-off job>.result == 'failure'",
+            f"Without it a refused {env!r} review fails only the sign-off job, "
+            "this required context still goes green, and clause iii's approval "
+            "is advisory.",
+        )
+        filter_job = pinned(
+            NEVER_REQUESTED_RE,
+            lambda m: m.group(1) == signoff_filter and m.group(2) in env_jobs,
+            f"needs.{signoff_filter}.outputs.{FLOOR_CORE_OUTPUT} == 'true' && "
+            "needs.<sign-off job>.result != 'success'",
+            "Without it a sign-off that was never requested -- the job skipped "
+            "because its trigger was edited -- leaves this required context "
+            "green, and the review lapses without a refusal.",
+        )
+        _check_reads_filter(jobs, job_id, filter_job, f"the {FLOOR_CONTEXT!r} job")
+        pinned(
+            UNCLASSIFIED_RE,
+            lambda m: m.group(1) == filter_job,
+            f"needs.{filter_job}.result != 'success'",
+            "Without it a path filter that failed or was skipped leaves the "
+            "sign-off job SKIPPED rather than refused, and this required "
+            "context goes green with no classification ever having run.",
+        )
 
 
 def _descope_warning() -> str:
@@ -708,9 +996,10 @@ def _write_descope_summary(message: str) -> None:
         return
     body = (
         "## Floor self-anchor: floor.yml path lock DESCOPED (PRD E2)\n\n"
-        "Documented capability gap -- a **warning, not a failure**. The two hard "
-        "requirements (both floor checks required + branch protection readable) "
-        "still gate this job fail-closed.\n\n"
+        "Documented capability gap -- a **warning, not a failure**. The three "
+        "hard requirements (both floor checks required + branch protection "
+        "readable + clause iii's sign-off environment present and wired) still "
+        "gate this job fail-closed.\n\n"
         f"> {message}\n"
     )
     try:
@@ -725,8 +1014,8 @@ def warn_path_lock_descoped() -> None:
 
     Replaces the former ``check_path_restriction`` hard check. The path lock is a
     documented capability gap (``PATH_LOCK_DESCOPED``), so it is surfaced, not
-    enforced. Returns normally so the anchor job stays green on its two hard,
-    still-fail-closed requirements.
+    enforced. Returns normally so the anchor job stays green on its three
+    hard, still-fail-closed requirements.
     """
     message = _descope_warning()
     # A GitHub Actions ::warning:: annotation on stderr so it is loud in the log.
