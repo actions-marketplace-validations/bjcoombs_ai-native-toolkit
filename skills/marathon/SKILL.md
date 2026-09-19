@@ -85,8 +85,11 @@ Everything else — the DAG analysis, hot-file combining, tracking file, smart-m
 
 Before decomposing the run (Step 1), the acceptance contract must be frozen. Invoke the start gate first:
 
+The contract scripts live in the plugin package (`${CLAUDE_PLUGIN_ROOT}/scripts/contract/`), while the contract artifacts (contract, kill test, completion record) live in the target repository's `.taskmaster/contract/`, the scripts' default `--contract-dir`. When `CLAUDE_PLUGIN_ROOT` is unset (a hand-placed checkout rather than an installed plugin) the guard line before each invocation falls back to the current checkout.
+
 ```bash
-python scripts/contract/start_gate.py <run-id>   # run-id = the Task Master tag (/tm) or issue-queue slug (/issues)
+: "${CLAUDE_PLUGIN_ROOT:=.}"   # unset outside an installed plugin: fall back to the current checkout
+python "${CLAUDE_PLUGIN_ROOT}/scripts/contract/start_gate.py" <run-id>   # run-id = the Task Master tag (/tm) or issue-queue slug (/issues)
 ```
 
 `start_gate.py` fails closed (non-zero) unless the run has freeze evidence (a contract frozen before decomposition per `FLOOR.md` clause ii) or an `operator_signoff`-recorded signed skip. A signed skip is loud, human-authorized, and permanently caps the run at `UNVERIFIED` — it can never certify `PASS`. Do not run Step 1 or spawn any teammate until this gate exits zero. Part of the constitutional floor (`FLOOR.md`); the retro may propose changes to this step but never self-apply them.
@@ -98,9 +101,12 @@ Never run source-of-truth write commands as parallel background jobs — concurr
 
 Enumerate work units via the adapter's **enumerate** operation.
 
+**Verification units.** An adapter may mark some enumerated units as a `verification unit` (a decomposed parent whose children are the real work units, e.g. a GitHub issue with sub-issues). Never spawn an implementing teammate for a verification unit and never place it in a wave. Its children enter the run only through the adapter's own enumerate filter, never by expansion from the parent. It becomes eligible only when its last child merges, a state the adapter defines; check it at enumerate time too, so a parent whose children all merged before this run is verified before Wave 1 rather than never. The lead then owns the parent's acceptance check, a lead-run step over the merged children outside the custody chokepoint. Per Lead Authority the lead does not execute it inline: it spawns a read-only subagent for the check, keeps the merge loop moving, and acts on the returned result. The check does not go through `spawn_verifier.py`, adds no freeze, and does not replace the run-level contract verification gate in Completion. The adapter's rule decides how the parent closes.
+
 **Analyze dependency tree for maximum concurrency:**
 
 1. Map the dependency tree — which tasks block which?
+   - An open-PR blocker (a unit that must wait for an already-open pull request) is treated per the adapter's recorded answer. Where the source cannot express it as a native edge (GitHub: `PR-as-blocker` is unsupported), the adapter reports it as run-plan sequencing: treat it as an unsatisfied dependency and hold the unit out of every wave until that PR merges.
 2. Identify the critical path (longest sequential chain)
 3. **Challenge unnecessary dependencies** — different files/modules may not need sequencing
 4. Look for tasks chained sequentially that could run in parallel
@@ -141,6 +147,12 @@ Enumerate work units via the adapter's **enumerate** operation.
 
    Optimizations:
    - Removed dependency <X> → <Y>: different modules
+
+   Staleness outcomes:
+   - Unit <X> <-> open PR <M>: <combine | sequence after the PR | kicked back> (<shared files>)
+
+   Verification units:
+   - <parent>: children <ids> (<merged>/<total> merged; checked after <last child>, or skipped: <reason>)
    ```
 9. Apply dependency changes via the work source's dependency-update mechanism.
 
@@ -274,12 +286,12 @@ Additive files (imports, barrel exports, routes): accept both sides. Same-line c
 3. **Get required checks green, then stand down.** Use the pr-review-merge skill's criteria and thread rules to fix any failing *required* checks and resolve any bot threads already posted, pushing fixes. Then report and go idle. **Do NOT run a `gh pr checks --watch` loop or any background CI watcher** - in marathon mode the lead owns CI watching, the slow `claude-review`/AI-review wait, and the merge. A teammate that watches a slow advisory check sits idle for minutes and floods the lead with idle notifications; that is the lead's job here, not yours. While your PR is not yet at required-green the lead may message you to fix a failing check or thread - respond and push. Once you send REVIEW_CLEAR you are done: the lead does not re-wake you, it spawns a fresh teammate if more work surfaces (one task, one teammate).
 
 ## Communication
-Only message the lead for **meaningful events**. Send the matching JSON payload from [Teammate Event Payloads](#teammate-event-payloads) as the message `content` (the `event` field self-identifies it; the `summary` stays human-readable):
-- PR created: `SendMessage(type: "message", recipient: "lead", content: JSON.stringify({event: "PR_CREATED", task_id: "<tag>.<task-id>", pr_number: <number>, branch: "<branch>"}), summary: "PR created <task-id>")`
-- Review clear: `SendMessage(type: "message", recipient: "lead", content: JSON.stringify({event: "REVIEW_CLEAR", task_id: "<tag>.<task-id>", pr_number: <number>, required_checks_green: true, threads_resolved: true}), summary: "Review clear <task-id> — standing down (lead owns claude-review wait + merge)")`
-- Blocked: `SendMessage(type: "message", recipient: "lead", content: JSON.stringify({event: "BLOCKED", task_id: "<tag>.<task-id>", pr_number: <number>, blocking_reason: "<reason>", blocking_category: "merge_conflict|ci_failure|dependency|external"}), summary: "Blocked <task-id>")`
-- Too complex: `SendMessage(type: "message", recipient: "lead", content: JSON.stringify({event: "TOO_COMPLEX", task_id: "<tag>.<task-id>", complexity_reason: "<reason>", suggested_decomposition: ["<subtask>", "<subtask>"]}), summary: "Too complex <task-id>")`
-- Clarification needed: `SendMessage(type: "message", recipient: "lead", content: JSON.stringify({event: "CLARIFICATION_NEEDED", task_id: "<tag>.<task-id>", question: "<question>", context: "<context>"}), summary: "Clarification <task-id>")`
+Only message the lead for **meaningful events**. Send the matching JSON payload from [Teammate Event Payloads](#teammate-event-payloads) as the message `content`, **prefixed with the event name on the same line** (`PR_CREATED {...}`) - the harness parses a bare JSON-object body against its shutdown/plan-approval protocol union and rejects any other shape, so a bare `JSON.stringify(...)` body never sends. The `event` field self-identifies it; the `summary` stays human-readable:
+- PR created: `SendMessage(type: "message", recipient: "lead", content: "PR_CREATED " + JSON.stringify({event: "PR_CREATED", task_id: "<tag>.<task-id>", pr_number: <number>, branch: "<branch>"}), summary: "PR created <task-id>")`
+- Review clear: `SendMessage(type: "message", recipient: "lead", content: "REVIEW_CLEAR " + JSON.stringify({event: "REVIEW_CLEAR", task_id: "<tag>.<task-id>", pr_number: <number>, required_checks_green: true, threads_resolved: true}), summary: "Review clear <task-id> — standing down (lead owns claude-review wait + merge)")`
+- Blocked: `SendMessage(type: "message", recipient: "lead", content: "BLOCKED " + JSON.stringify({event: "BLOCKED", task_id: "<tag>.<task-id>", pr_number: <number>, blocking_reason: "<reason>", blocking_category: "merge_conflict|ci_failure|dependency|external"}), summary: "Blocked <task-id>")`
+- Too complex: `SendMessage(type: "message", recipient: "lead", content: "TOO_COMPLEX " + JSON.stringify({event: "TOO_COMPLEX", task_id: "<tag>.<task-id>", complexity_reason: "<reason>", suggested_decomposition: ["<subtask>", "<subtask>"]}), summary: "Too complex <task-id>")`
+- Clarification needed: `SendMessage(type: "message", recipient: "lead", content: "CLARIFICATION_NEEDED " + JSON.stringify({event: "CLARIFICATION_NEEDED", task_id: "<tag>.<task-id>", question: "<question>", context: "<context>"}), summary: "Clarification <task-id>")`
 
 `REVIEW_CLEAR` reports shape, not a verdict the lead trusts blindly — set `required_checks_green`/`threads_resolved` only when genuinely true, but expect the lead to re-verify both via the GitHub API before merging.
 
@@ -310,7 +322,7 @@ Each event is a JSON object whose `event` field names the type. Required fields 
 ## Lifecycle
 1. Implement → push incrementally → create PR → message lead PR_CREATED
 2. Fix any failing **required** checks and any already-posted bot threads; push. Do NOT watch CI - the lead owns that.
-3. Message lead REVIEW_CLEAR (required checks green, threads resolved) and stand down. Do not sit through the slow `claude-review`/AI-review window - that wait is the lead's to hold.
+3. Message lead REVIEW_CLEAR once `pr-review-merge` ready criteria 1-5 hold on your head (required checks green, threads resolved) and stand down. Criterion 6 (every bot flagged `Re-reviews on push` has reviewed the head SHA, or its `Max wait for re-review` expired) is the lead's to apply at merge time in marathon mode - do not sit through a flagged bot's review window, and do not run a CI watch loop for it. The lead re-verifies criterion 6 on whatever head it merges, and any push after REVIEW_CLEAR re-opens that check.
 4. The lead owns the claude-review wait + merge, cleans up, and shuts you down at green. After REVIEW_CLEAR you are not re-woken - if more work surfaces the lead spawns a fresh teammate (one task, one teammate). **Approve the lead's `shutdown_request` promptly when it arrives, and after REVIEW_CLEAR do NOT idle-ping or re-send merge-readiness nudges** — the lead owns the merge; re-nudging an already-cleared PR just churns the lead while it holds the claude-review wait.
 """
 )
@@ -346,7 +358,7 @@ Read the `event` field of the message's JSON payload (see [Teammate Event Payloa
 2. Decompose: expand the task into subtasks (or cancel + create new peer tasks for sibling split)
 3. Spawn fresh teammates for resulting tasks
 
-**Shut teammates down early to kill idle churn**: The moment a teammate's PR has required checks green and threads resolved (its REVIEW_CLEAR, or your own poll showing it), shut the teammate down - do not leave it idle through the claude-review wait and the merge. The lead owns that tail. A live-but-idle teammate emits a continuous stream of idle notifications (the harness re-pings idle members), which is pure attention-drain on the lead; early shutdown is the fix, not patience. This is also why teammates are told not to run their own CI watcher - the lead watches, the lead merges, the teammate is gone before the slow advisory checks finish. If you have sent a `shutdown_request` and the teammate keeps emitting idle notifications without approving it, re-send the request once rather than sitting through the idle stream — the re-send re-prompts it to process the approval.
+**Shut teammates down early to kill idle churn**: The moment a teammate's PR has required checks green and threads resolved (its REVIEW_CLEAR, or your own poll showing it), shut the teammate down - do not leave it idle through the claude-review wait and the merge. The lead owns that tail. A live-but-idle teammate emits a continuous stream of idle notifications (the harness re-pings idle members), which is pure attention-drain on the lead; early shutdown is the fix, not patience. This is also why teammates are told not to run their own CI watcher - the lead watches, the lead merges, the teammate is gone before the slow advisory checks finish. If you have sent a `shutdown_request` and the teammate keeps emitting idle notifications without approving it, do not re-send the protocol request: send ONE plain-text message that spells out the exact approval call - `SendMessage(to: "team-lead", message: {"type": "shutdown_response", "request_id": "<the queued request_id>", "approve": true})` - which unwedges the queued protocol message every time (validated across two marathons, ~20/20; a "not reachable" reply means it already exited).
 
 **Lead conflict resolution**: When a teammate is idle and their PR is DIRTY (merge conflict), resolve it directly instead of nudging the teammate. Pull `$BASE_BRANCH`, resolve the conflict, push. Faster than round-tripping to an idle teammate (~10 min saved per conflict). This idle-DIRTY conflict is the **sole** work the lead executes directly — it does not generalize: a failing test, missing implementation, or thread fix is still delegated per [Lead Authority](#lead-authority), even when it looks like a quick edit. If the teammate whose branch you're resolving may still be live (not yet idle/down), message it *before* you push — "leave the version conflict to me, I'm resolving" — then push; pushing first races with the teammate resolving the same conflict in its own worktree.
 
@@ -387,7 +399,7 @@ If green with 0 unresolved threads, run smart-merge regardless of teammate messa
 ## Smart Merge
 
 The lead runs smart-merge via the pr-review-merge skill (Smart Merge section): dismiss stale
-bot CRs, verify the four auto-merge criteria, handle UNSTABLE/UNKNOWN, merge in hot-file order.
+bot CRs, verify the five auto-merge criteria, handle UNSTABLE/UNKNOWN, merge in hot-file order.
 On a solo-maintainer repo (0 required approvals) merge with `gh pr merge $PR --squash --delete-branch --admin`
 once the *required* checks are green — a plain merge gets bounced when a non-required check (CodeRabbit,
 an advisory AI review, a regression gate that re-runs on base advance) is mid-run at the merge instant.
@@ -413,10 +425,21 @@ only after confirming `gh pr view $PR --json state --jq '.state' == "MERGED"`. N
 unconditionally after the merge call — a rejected merge with chained cleanup deletes the branch/worktree
 of a PR that never merged (recoverable via the remote branch, but it wastes a recovery cycle every time).
 
-**Don't merge an AI-authored docs/content PR while its AI reviewer is still pending.** Even when the
-required checks are green and `mergeStateStatus` is CLEAN, wait for `claude[bot]`/`claude-review` to post —
-AI-written docs are exactly where AI-authoring residue (leaked tool-envelope tags, duplicated sections)
-hides, and the reviewer catches it. The minutes of waiting are cheaper than a follow-up PR + patch release.
+**Don't merge an AI-authored docs/content PR while its AI reviewer is still pending.** This hold is
+`pr-review-merge` Ready Criterion 6 applied, not a separate rule: the lead holds the merge for every bot the
+Marathon Configuration flags `Re-reviews on push: yes` until it has reviewed the head SHA, bounded by that bot's
+`Max wait for re-review` (15m when absent). For a bot with `Re-review check name` its check run on the head SHA has
+four states: in progress, keep waiting until the max wait expires; completed with conclusion `success`, the
+criterion is satisfied and the `Commit:`-line spot check below applies; completed with conclusion `skipped`, the
+bot does not apply to this PR, so the criterion is satisfied with no warning; completed with any other conclusion
+(failure, cancelled, neutral, timed_out), a settled verdict that the bot did not complete a green pass, so
+take the warning path at once. On expiry or a settled run whose conclusion is neither `success` nor `skipped`, merge with a warning in the merge record
+naming the bot, the head SHA, the run's conclusion, and whether the reviews endpoint shows a review of that head
+SHA anyway; nothing holds forever on an advisory bot. The reason to flag an AI reviewer `Re-reviews on push: yes`:
+AI-written docs are exactly where AI-authoring residue (leaked tool-envelope tags, duplicated sections) hides,
+and the reviewer catches it. The minutes of waiting are cheaper than a follow-up PR + patch release.
+
+**A green `claude-review` check is evidence the reviewer completed, not that it reviewed the right head.** The workflow's final-status step now turns the check red when the action exits with `is_error: true`, an empty execution log, or a missing result entry (the silent-success failure seen on four PRs in 2026-09-04), which is why criterion 6 keys on the check run for this bot. Before merging on the strength of a review, confirm the reviewer's sticky summary comment cites the PR **head sha** in its `Commit:` line (or that `claude[bot]` resolved threads on that head). If the check is green but the summary still cites an older sha, the head was not reviewed: re-run the workflow once, and if it fails the same way, stand up a cold local reviewer per PR (a fresh agent with no authoring context, read-only, re-running the PR's measurements and verifying each open thread), post a comment disclosing that substitution, and resolve threads on that evidence. A red `claude-review` run, or any settled conclusion other than `success` or `skipped`, is not this case: it is criterion 6's warning-path state, which merges with a warning at once.
 
 **Any push after REVIEW_CLEAR re-opens the verify gate.** A lead conflict-resolution, a base-advance
 re-trigger, or a late fix all produce a new head, and bots re-review that new commit — a reviewer that
@@ -428,10 +451,10 @@ strength of the earlier REVIEW_CLEAR alone.
 1. Report to user
 2. Confirm the teammate is already down — you stood it down at REVIEW_CLEAR; this is a confirm-pane-dead check, not a second shutdown, and is **not** gated on the merge. The verified-`MERGED` gate below guards *cleanup* (step 3 onward), not the shutdown.
 3. Mark internal task completed
-4. Check for newly unblocked tasks
+4. Check for newly unblocked tasks. If this merge made a verification unit eligible (its last child merged, per the adapter's rule), spawn that parent's read-only acceptance-check subagent now, continue to the wave transition, and close or report the parent per the adapter when the result returns.
 5. **Wave transition**: Batch-dismiss stale CRs across all eligible PRs before spawning next wave. Review signals from completed wave, adapt next prompts with learnings.
 6. Check ready tasks via the adapter's enumerate operation filtered to `pending` status. Spawn fresh teammates for ready tasks.
-7. If all done → [Completion](#completion--retrospective)
+7. If all done → [Completion](#completion--retrospective). "All done" includes every eligible verification unit: wait for each outstanding parent acceptance-check subagent to return and for its parent to be closed or reported per the adapter before entering Completion.
 
 **If not merge-ready:**
 - BLOCKED → report to user, message teammate
@@ -489,7 +512,7 @@ The lead operates as a **tech lead running a sprint** — not a task router.
 
 1. Send `shutdown_request` to each remaining teammate **once**. Each approves with a structured `shutdown_response` (addressed to `team-lead`, echoing the `request_id`, `approve: true`), which terminates it. Treat that approval, or an already-exited teammate, as the completion signal - don't block waiting on one that has already gone.
 2. Once every teammate has acknowledged shutdown or already exited, the team is gone - background teammates reap when the session exits. If a stale one lingers, verify its pane/process is dead. Nothing persists to block a future marathon.
-3. **Contract verification gate (non-removable)** — before the PRD-delivery check, run-complete requires a fresh non-implementing agent to execute the frozen acceptance contract against the assembled product. The frozen contract is required (its sha256 was recorded at freeze; the verifier re-hashes it and a mid-run edit aborts the run rather than certifying against a moved target). Spawn the cold verifier ONLY through the custody chokepoint — `python scripts/contract/spawn_verifier.py <frozen-contract-path> <assembled-product-path>` (exactly two positional inputs; the run-id is derived from the contract filename, and the chokepoint mints the provenance token and writes the side-channel). Drive the verifier with the emitted prompt, record its per-criterion observed results into the completion record, then gate completion with `python scripts/contract/complete_gate.py <run-id>`, which fails closed (non-zero) unless `scripts/contract/validate_completion.py` accepts the record — no record, a record without verifier results, or a rejected record all block completion. The run is not complete until this gate exits zero. Part of the constitutional floor (`FLOOR.md`); the retro may propose changes but never self-apply them.
+3. **Contract verification gate (non-removable)** — before the PRD-delivery check, run-complete requires a fresh non-implementing agent to execute the frozen acceptance contract against the assembled product. The frozen contract is required (its sha256 was recorded at freeze; the verifier re-hashes it and a mid-run edit aborts the run rather than certifying against a moved target). Spawn the cold verifier ONLY through the custody chokepoint — `python "${CLAUDE_PLUGIN_ROOT}/scripts/contract/spawn_verifier.py" <frozen-contract-path> <assembled-product-path>` (exactly two positional inputs; the run-id is derived from the contract filename, and the chokepoint mints the provenance token and writes the side-channel). Drive the verifier with the emitted prompt, record its per-criterion observed results into the completion record, then gate completion with `python "${CLAUDE_PLUGIN_ROOT}/scripts/contract/complete_gate.py" <run-id>`, which fails closed (non-zero) unless `${CLAUDE_PLUGIN_ROOT}/scripts/contract/validate_completion.py` accepts the record — no record, a record without verifier results, or a rejected record all block completion. Prefix these with the same `: "${CLAUDE_PLUGIN_ROOT:=.}"` guard line as the entry gate so an unset variable falls back to the current checkout instead of a missing absolute path. The run is not complete until this gate exits zero. Part of the constitutional floor (`FLOOR.md`); the retro may propose changes but never self-apply them.
 4. **PRD delivery check** — Re-read the original work units' acceptance criteria (PRD, issue bodies, or task details) and cross-reference against merged PRs. Report:
    - Criteria met (with PR evidence)
    - Criteria not met or partially met (flag for user)

@@ -33,47 +33,217 @@ workflow (``.github/workflows/floor.yml``) and pytest both drive:
     arms itself automatically the moment a marker lands and bites only when one
     is taken away -- including when the whole marked file is deleted.
 
+    Neither the marked set nor the token set is a constant here. The marked set
+    is *discovered* at the base ref (``_discover_marked_files``): every tracked
+    file carrying a standalone anchor line, ``FLOOR.md`` excluded because it is
+    the file that defines the marker. The token set is read from the
+    ``floor-tokens`` fenced block of ``git show <base>:FLOOR.md``, falling back
+    to the working tree only while the base predates that block. Both are data
+    the floor declares, so a file that moves, a file that arrives, and a token
+    that is added are all enforced with no edit to this script.
+
+    A move is *followed* rather than read as a deletion. ``git diff -M50%``
+    maps each base path to its head path, and the comparison for a mapped pair
+    is ``BASE:old`` against ``HEAD:new``, so a byte-identical relocation passes
+    with no floor edit while a relocation that also weakens a token still fails
+    on the token comparison. A mapped destination has to be a plausible
+    component path (``_is_valid_component_path``); a "move" into an archive
+    directory is a deletion wearing a rename and is reported as one, naming the
+    rejected destination.
+
+``protected``
+    Directory-*role* classification of a changed-path list -- the one path
+    decision the CI workflow makes, so the workflow itself carries no path
+    literals to keep in sync. A path is protected when it falls in one of four
+    roles: it lives under the component directory of a marked file (marked at
+    the base ref *or* on the head side, so a component marked in the PR itself
+    is protected from that PR on), it is gate code, it is canary code or
+    fixtures, or it is floor core. Each role is a whole subtree rather than a
+    basename allowlist, so the protected set survives a layout move that a
+    hand-maintained path regex would silently drop.
+
+``signoff-summary``
+    The explanation shown to the maintainer when the floor-core sign-off is
+    requested: why (clause iii), which floor-core paths changed and by how many
+    lines, the head commit the approval covers, and what approving and
+    rejecting mean. The paths come from the ``floor-core`` role the trigger
+    asks for; CI renders with the base ref's copy, so the two agree unless the
+    pull request edits the classification itself, and then the section still
+    appears (this script is floor core in the base copy that renders it)
+    and at worst counts a newly floor-core path among the other changed
+    paths, which it breaks down by role. When the floor core changes only by like-for-like ``uses:`` pin
+    bumps the section says so and lists each action's old and new commit.
+    Prints nothing when the floor core is untouched.
+
 ``clauses``
-    Unconditional integrity check of ``FLOOR.md``: the file must exist and each
-    of the four clauses must be present, anchor *and* key phrase, so a PR that
-    guts a clause's text while leaving its anchor comment still fails.
+    Unconditional integrity check of ``FLOOR.md``: the file must exist, it must
+    declare its ``floor-tokens`` block with at least the four tokens the floor
+    ships with, and each of the four clauses must be present, anchor *and* key
+    phrase, so a PR that guts a clause's text while leaving its anchor comment
+    still fails.
 
 Stdlib only; runnable as ``python scripts/floor_check.py <subcommand>``.
+Paths are relative to the current directory, which is the repository root.
 """
 from __future__ import annotations
 
 import argparse
+import re
+import string
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-# ── Floor tokens ─────────────────────────────────────────────────────────────
+# ── The one anchor string ────────────────────────────────────────────────────
+#
+# The marker is the single token this script has to know by heart: it is the
+# needle the discovery grep looks for. Every other token is declared by the
+# floor itself, in FLOOR.md's floor-tokens block.
 
 MARKER = "<!-- floor:cold-verify-completion -->"
-INVOCATIONS = ("start_gate.py", "spawn_verifier.py", "complete_gate.py")
-FLOOR_TOKENS = (MARKER, *INVOCATIONS)
 
-# Files that carry a floor obligation (repo-root-relative). The markers are not
-# all present yet -- removal detection is a no-op for a token a file never had.
-MARKED_FILES = (
-    "skills/marathon/SKILL.md",
-    "skills/pr-review-merge/SKILL.md",
-    "commands/tm.md",
-    "commands/issues.md",
-)
-
-# FLOOR.md clause integrity: each clause must carry its anchor AND a distinctive
-# phrase, so gutting the prose while keeping the anchor comment still fails.
 FLOOR_FILE = "FLOOR.md"
+
+# The fenced block in FLOOR.md that declares the floor tokens, one per line.
+TOKEN_BLOCK_FENCE = "```floor-tokens"
+
+# The floor ships with four tokens (the marker plus three gate invocations).
+# Shrinking that set is a floor change, not a refactor, so a block carrying
+# fewer than this is refused.
+MINIMUM_TOKEN_COUNT = 4
+
+# FLOOR.md clause integrity: each clause must carry its anchor AND its
+# distinctive phrases, so gutting the prose while keeping the anchor comment
+# still fails.
 REQUIRED_CLAUSES = {
     "i": ("<!-- floor-clause:i -->", "run-complete"),
     "ii": ("<!-- floor-clause:ii -->", "unamendable"),
-    "iii": ("<!-- floor-clause:iii -->", "out-of-band"),
+    "iii": ("<!-- floor-clause:iii -->", "out-of-band", "floor-signoff"),
     "iv": ("<!-- floor-clause:iv -->", "immutab"),
 }
 
+# ── Component shapes ─────────────────────────────────────────────────────────
+#
+# The three paths a shipped component can live at. A marked file has to sit at
+# one of them for a rename to read as a relocation rather than a deletion, and
+# for the file to have a component *directory* the `protected` roles can span.
+# The shapes are structural, not a list of names, so a component that is added
+# or moved between them needs no edit here.
+
+VALID_COMPONENT_RE = re.compile(
+    r"^(?:skills/[^/]+/SKILL\.md"
+    r"|plugins/[^/]+/skills/[^/]+/SKILL\.md"
+    r"|commands/[^/]+\.md)$"
+)
+
+# ── Protected roles ──────────────────────────────────────────────────────────
+#
+# Whole subtrees, never basenames: narrowing any of these to the files that
+# happen to live there today would quietly drop the rest on the next move.
+
+ROLE_MARKED_COMPONENT = "marked-component"
+ROLE_GATE_CODE = "gate-code"
+ROLE_CANARY = "canary"
+ROLE_FLOOR_CORE = "floor-core"
+
+ROLES = (ROLE_MARKED_COMPONENT, ROLE_GATE_CODE, ROLE_CANARY, ROLE_FLOOR_CORE)
+
+# The gates the canary suite drives.
+GATE_CODE_PREFIXES = ("scripts/contract/",)
+
+# The canary harness and the fixtures it certifies.
+CANARY_PREFIXES = ("scripts/canaries/", "tests/canaries/")
+
+# The floor's own machinery: the file that declares it, the two scripts that
+# enforce it, and the workflow that runs them.
+FLOOR_CORE_PATHS = (
+    FLOOR_FILE,
+    "scripts/floor_check.py",
+    "scripts/floor_anchor.py",
+    ".github/workflows/floor.yml",
+)
+
+
+# The sign-off explanation's section title. (The workflow finds its own
+# pull-request comment by a hidden marker it adds, not by this title.) The
+# clause purpose is read from FLOOR.md at the base ref and falls back to this
+# sentence when the file there does not carry the clause.
+SIGNOFF_HEADING = "Floor sign-off requested"
+CLAUSE_III_PURPOSE = "Changes to the floor require the maintainer's out-of-band sign-off."
+CLAUSE_III_HEADING_RE = re.compile(
+    r"<!-- floor-clause:iii -->\s*\*\*iii\.\s+(.+?)\*\*", re.DOTALL
+)
+
+# One changed workflow line that is only an action pin:
+# ``- uses: owner/action@<sha>  # <version>`` (the list dash is optional).
+# The action and the version comment are pull-request text that the summary
+# renders, so both are held to a charset that carries no markdown or HTML
+# meaning. A `uses:` line outside it is not a pin: the pin-only verdict is
+# withheld and the line counts stand.
+USES_PIN_RE = re.compile(
+    r"^\s*(?:-\s+)?uses:\s*([\w.\-/]+)@([0-9a-fA-F]{7,40})"
+    r"\s*(?:#\s*([\w.+\-/ ]*?))?\s*$",
+    re.ASCII,
+)
+
+# Text the summary may put in a code span as it stands: no backtick, no
+# angle bracket, no emphasis or link syntax, no leading or trailing space.
+MD_CODE_SAFE_RE = re.compile(r"[\w.+\-/@]+(?: [\w.+\-/@]+)*", re.ASCII)
+
+
+class FloorTokenError(ValueError):
+    """FLOOR.md does not declare a usable floor-tokens block."""
+
 
 # ── Pure logic (unit-tested) ─────────────────────────────────────────────────
+
+def _parse_token_block(floor_text: str | None) -> list[str]:
+    """Floor tokens declared by ``FLOOR.md``, in declaration order.
+
+    The tokens live in exactly one fenced block whose opening fence line is
+    ``TOKEN_BLOCK_FENCE``, one token per line. Raises ``FloorTokenError`` when
+    the block is absent, duplicated, unterminated, or carries fewer than
+    ``MINIMUM_TOKEN_COUNT`` tokens -- shrinking the floor's token set is a floor
+    change and has to go red rather than quietly narrow the check.
+    """
+    if floor_text is None:
+        raise FloorTokenError(
+            f"{FLOOR_FILE} is absent, so its {TOKEN_BLOCK_FENCE!r} token block "
+            f"cannot be read"
+        )
+    lines = floor_text.splitlines()
+    opens = [i for i, line in enumerate(lines) if line.strip() == TOKEN_BLOCK_FENCE]
+    if not opens:
+        raise FloorTokenError(
+            f"no {TOKEN_BLOCK_FENCE!r} token block in {FLOOR_FILE}: the floor "
+            f"must declare its tokens"
+        )
+    if len(opens) > 1:
+        raise FloorTokenError(
+            f"{len(opens)} {TOKEN_BLOCK_FENCE!r} token blocks in {FLOOR_FILE}: "
+            f"the floor must declare exactly one"
+        )
+    tokens: list[str] = []
+    closed = False
+    for line in lines[opens[0] + 1:]:
+        if line.startswith("```"):
+            closed = True
+            break
+        token = line.strip()
+        if token:
+            tokens.append(token)
+    if not closed:
+        raise FloorTokenError(
+            f"the {TOKEN_BLOCK_FENCE!r} token block in {FLOOR_FILE} is never closed"
+        )
+    if len(tokens) < MINIMUM_TOKEN_COUNT:
+        raise FloorTokenError(
+            f"the {TOKEN_BLOCK_FENCE!r} token block in {FLOOR_FILE} declares "
+            f"{len(tokens)} token(s); the floor requires at least "
+            f"{MINIMUM_TOKEN_COUNT}"
+        )
+    return tokens
+
 
 def standalone_anchor_count(text: str | None, marker: str = MARKER) -> int:
     """Number of *standalone* anchor lines: lines whose stripped content is the
@@ -91,9 +261,13 @@ def standalone_anchor_count(text: str | None, marker: str = MARKER) -> int:
 def removed_tokens(
     base_text: str | None,
     head_text: str | None,
-    tokens=FLOOR_TOKENS,
+    tokens,
 ) -> list[str]:
     """Floor tokens *weakened* from ``base_text`` to ``head_text``.
+
+    ``tokens`` is the set the floor declares (see ``_parse_token_block``); it is
+    passed in rather than read from a constant so the enforced set is whatever
+    ``FLOOR.md`` says it is.
 
     A token is flagged when either signal fires (see the module docstring):
 
@@ -126,6 +300,55 @@ def removed_tokens(
     return removed
 
 
+def _is_valid_component_path(path: str) -> bool:
+    """Is ``path`` one of the three shapes a shipped component can live at?
+
+    Used two ways: to decide whether a rename destination is a relocation or a
+    deletion wearing a rename, and to decide whether a marked file has a
+    component directory the protected roles can span.
+    """
+    return bool(VALID_COMPONENT_RE.match(path))
+
+
+def _component_dir(path: str) -> str | None:
+    """The component ``path`` belongs to, or ``None`` if it is not a component.
+
+    A ``SKILL.md`` component is its parent directory and everything beneath it
+    (``skills/marathon/forge/`` belongs to the marathon component); a
+    ``commands/<x>.md`` component is that single file. A path matching none of
+    the component shapes -- a prose carrier under ``docs/``, say -- has no
+    component directory, so quoting the marker in prose protects nothing.
+    """
+    if not _is_valid_component_path(path):
+        return None
+    if path.endswith("/SKILL.md"):
+        return str(PurePosixPath(path).parent)
+    return path
+
+
+def _is_under(path: str, component: str) -> bool:
+    """Is ``path`` the component itself, or anything beneath it?"""
+    return path == component or path.startswith(f"{component}/")
+
+
+def classify_path(path: str, component_dirs) -> str | None:
+    """The protected role of ``path``, or ``None`` when it is unprotected.
+
+    ``component_dirs`` is the set of marked-component directories in play (see
+    ``_component_dir``). The roles do not overlap on this tree, so the order
+    below is a reading order, not a precedence rule.
+    """
+    if path in FLOOR_CORE_PATHS:
+        return ROLE_FLOOR_CORE
+    if any(path.startswith(prefix) for prefix in GATE_CODE_PREFIXES):
+        return ROLE_GATE_CODE
+    if any(path.startswith(prefix) for prefix in CANARY_PREFIXES):
+        return ROLE_CANARY
+    if any(_is_under(path, component) for component in component_dirs):
+        return ROLE_MARKED_COMPONENT
+    return None
+
+
 def missing_clauses(floor_text: str | None) -> list[str]:
     """Clause ids whose anchor or key phrase is missing from ``FLOOR.md``.
 
@@ -140,50 +363,390 @@ def missing_clauses(floor_text: str | None) -> list[str]:
     return missing
 
 
+def clause_iii_purpose(floor_text: str | None) -> str:
+    """Clause iii's bold one-sentence purpose, as ``FLOOR.md`` states it."""
+    match = CLAUSE_III_HEADING_RE.search(floor_text or "")
+    if match is None:
+        return CLAUSE_III_PURPOSE
+    return " ".join(match.group(1).split())
+
+
+def md_literal(text: str) -> str:
+    """``text`` as inert markdown: a code span when it holds only safe
+    characters, otherwise plain text with every ASCII punctuation character
+    backslash-escaped and every unprintable character spelled as its code
+    point, so pull-request text can close no code span, open no HTML comment
+    and form no emphasis or link in the approver's view."""
+    if MD_CODE_SAFE_RE.fullmatch(text):
+        return f"`{text}`"
+    out = []
+    for ch in text:
+        if ch in string.punctuation:
+            out.append("\\" + ch)
+        elif ch.isprintable():
+            out.append(ch)
+        else:
+            out.append("\\\\" + f"u{ord(ch):04x}")
+    return "".join(out)
+
+
+_Pin = tuple[str, str, str]
+
+
+def _pin_lines(diff_text: str) -> list[tuple[list[_Pin], list[_Pin]]] | None:
+    """The removed and added ``(action, commit, version)`` pins of a ``-U0``
+    diff, one ``(removed, added)`` pair per hunk in diff order, or ``None``
+    when a changed line is not a pin. A hunk belongs to one file, so keeping
+    the hunks apart keeps the files apart too."""
+    hunks: list[tuple[list[_Pin], list[_Pin]]] = []
+    in_hunk = False
+    for line in diff_text.splitlines():
+        # Track hunk state rather than prefix-match headers: inside a hunk a
+        # leading `+`/`-` is always content, even a removed `---` rule.
+        if line.startswith("diff --git"):
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            hunks.append(([], []))
+            continue
+        if not in_hunk or not line.startswith(("+", "-")):
+            continue
+        match = USES_PIN_RE.match(line[1:])
+        if match is None:
+            return None
+        action, commit, version = match.groups()
+        removed, added = hunks[-1]
+        side = added if line.startswith("+") else removed
+        side.append((action, commit.lower(), version or ""))
+    return hunks
+
+
+def pin_changes(diff_text: str) -> list[tuple[str, str, str]] | None:
+    """The ``uses:`` pin changes in a ``-U0`` diff, or ``None`` when the diff
+    is anything other than a like-for-like bump (or changes nothing).
+
+    Each entry is ``(action, old, new)`` where ``old`` and ``new`` read
+    ``<commit> <version comment>``. Like-for-like means: every changed line is
+    a pin; within each hunk the removed and added pins name the same actions
+    in the same order (an action added, dropped, swapped for another or moved
+    changes what the workflow runs, and a pin removed in one hunk and added in
+    another, whether another job or another file, has moved, not been bumped
+    in place); and every pair either changes its commit or is the same pin
+    re-indented. A version comment relabelled on an unchanged commit is not a
+    bump, and a diff that changes no commit is not one either.
+    """
+    hunks = _pin_lines(diff_text)
+    if hunks is None:
+        return None
+    pairs: list[tuple[_Pin, _Pin]] = []
+    for removed, added in hunks:
+        if [pin[0] for pin in removed] != [pin[0] for pin in added]:
+            return None  # also a removal-only or addition-only hunk
+        pairs += zip(removed, added)
+    changes: list[tuple[str, str, str]] = []
+    for (action, old_commit, old_version), (_, new_commit, new_version) in pairs:
+        if old_commit == new_commit:
+            if old_version != new_version:
+                return None  # a relabelled comment, not a bump
+            continue  # the same pin re-indented
+        change = (
+            action,
+            f"{old_commit} {old_version}".strip(),
+            f"{new_commit} {new_version}".strip(),
+        )
+        if change not in changes:
+            changes.append(change)
+    return changes or None
+
+
+def render_signoff_summary(
+    paths: list[tuple[str, str]],
+    head_commit: str,
+    clause_purpose: str,
+    pins: list[tuple[str, str, str]] | None,
+    other_roles: dict[str, int] | None = None,
+) -> str:
+    """The markdown section the maintainer reads before approving.
+
+    ``paths`` is ``(path, detail)`` per changed floor-core path, where the
+    detail is ``+<added> -<removed>`` or ``binary change`` with the kind of
+    change (added, deleted, type change, mode change) named alongside.
+    ``other_roles`` counts the other changed paths by protected role
+    (``unprotected`` for the rest). They are counted, never listed, so the
+    verdict below is never read as covering them. Every path, commit, action
+    and version is pull-request text and goes through ``md_literal``.
+    """
+    others = {role: n for role, n in (other_roles or {}).items() if n}
+    breakdown = ", ".join(f"{n} {role}" for role, n in others.items())
+    lines = [
+        f"## {SIGNOFF_HEADING}",
+        "",
+        "This pull request changes the floor's own enforcement, so it waits on "
+        "the maintainer's deployment review of the `floor-signoff` environment.",
+        "",
+        f"**Why:** FLOOR.md clause iii. {clause_purpose}",
+        "",
+        f"**Head commit the approval covers:** {md_literal(head_commit)}",
+        "",
+        "**Floor-core paths changed:**",
+        "",
+    ]
+    lines += [f"- {md_literal(path)} {detail}" for path, detail in paths]
+    lines += [
+        "",
+        f"Other paths changed in this pull request (not floor core, not listed "
+        f"here): {sum(others.values())}" + (f" ({breakdown})" if breakdown else ""),
+    ]
+    if pins:
+        lines += [
+            "",
+            "**pin-only change:** every changed floor-core line is a `uses:` "
+            "action pin bumped in place, and no other floor-core line changed. "
+            "Each action shows its old commit and version -> its new commit and "
+            "version:",
+            "",
+        ]
+        lines += [
+            f"- {md_literal(action)}: {md_literal(old)} -> {md_literal(new)}"
+            for action, old, new in pins
+        ]
+    lines += [
+        "",
+        "**Approving** asserts that these changes to the floor's own "
+        "enforcement are intended.",
+        "",
+        "**Rejecting** turns the required `floor enforcement` check red, so "
+        "the pull request cannot merge.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 # ── Git plumbing ─────────────────────────────────────────────────────────────
 
-def _git_show(ref: str, path: str) -> str | None:
+def _git_show(ref: str, path: str, cwd: str | Path | None = None) -> str | None:
     """Content of ``path`` at ``ref``, or ``None`` if it did not exist there."""
     result = subprocess.run(
         ["git", "show", f"{ref}:{path}"],
         capture_output=True,
         text=True,
+        cwd=cwd,
     )
     if result.returncode != 0:
         return None
     return result.stdout
 
 
-def _read_head(path: str) -> str | None:
+def _read_head(path: str, cwd: str | Path | None = None) -> str | None:
     """Content of ``path`` in the working tree, or ``None`` if absent."""
-    p = Path(path)
+    p = Path(cwd) / path if cwd is not None else Path(path)
     if not p.exists():
         return None
     return p.read_text(encoding="utf-8")
 
 
+def _get_renames(base_ref: str, cwd: str | Path | None = None) -> dict[str, str]:
+    """``{old_path: new_path}`` for every file git maps as a rename.
+
+    ``-M50%`` is the deliberate threshold: a relocation that also edits the file
+    stays mapped (and is then judged on its tokens), while a rewrite past the
+    threshold leaves rename detection and is judged as a deletion. Raising it to
+    ``-M100%`` would make a whitespace change during a move read as a deletion;
+    dropping rename detection entirely would make every move read as one.
+
+    The diff is the working tree against ``base_ref``, which is what CI wants:
+    the checkout there is the PR merge commit.
+    """
+    result = subprocess.run(
+        ["git", "diff", "-M50%", "--name-status", "--diff-filter=R", base_ref],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    renames: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0].startswith("R"):
+            renames[parts[1]] = parts[2]
+    return renames
+
+
+def _discover_marked_files(
+    base_ref: str,
+    marker: str,
+    cwd: str | Path | None = None,
+) -> list[str]:
+    """Files carrying a floor obligation at ``base_ref``, discovered by token.
+
+    ``git grep`` finds every tracked file mentioning the marker at that ref;
+    the anchor filter then keeps only those whose content at the ref holds a
+    *standalone* anchor line, which drops the incidental carriers (prose that
+    quotes the marker, source that defines it). ``FLOOR.md`` is excluded outright:
+    it is the file that declares the marker, so its own mention is a definition,
+    not an obligation.
+    """
+    result = subprocess.run(
+        ["git", "grep", "-l", "-F", marker, base_ref, "--", f":!{FLOOR_FILE}"],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    prefix = f"{base_ref}:"
+    discovered = []
+    for line in result.stdout.splitlines():
+        path = line[len(prefix):] if line.startswith(prefix) else line.split(":", 1)[-1]
+        if not path:
+            continue
+        if standalone_anchor_count(_git_show(base_ref, path, cwd=cwd), marker) > 0:
+            discovered.append(path)
+    return discovered
+
+
+def _untracked_component_paths(cwd: str | Path | None = None) -> list[str]:
+    """Component-shaped paths present in the working tree but not tracked.
+
+    Deliberately *not* ``--exclude-standard``: the repo's ignore list is not the
+    floor's business. A component that exists on disk carries its obligation
+    whether or not ``.gitignore`` has caught up with the directory it lives in,
+    and a component the ignore list hides is exactly the case where silence
+    would be dangerous. The component-shape filter keeps this cheap -- nothing
+    else in an untracked tree (build output, virtualenvs, caches) can be a
+    component, so nothing else is even opened.
+    """
+    result = subprocess.run(
+        ["git", "ls-files", "--others"],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    return [
+        path
+        for path in result.stdout.splitlines()
+        if path and _is_valid_component_path(path)
+    ]
+
+
+def _discover_marked_files_head(
+    marker: str,
+    cwd: str | Path | None = None,
+) -> list[str]:
+    """The same discovery, run over the working tree instead of a ref.
+
+    A component marked by the PR under review carries no anchor at the base ref,
+    so base-side discovery alone would leave it unprotected on the very PR that
+    marks it. Reading the head side too closes that window: the obligation binds
+    from the commit that declares it, not from the one after.
+    """
+    result = subprocess.run(
+        ["git", "grep", "-l", "-F", marker, "--", f":!{FLOOR_FILE}"],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+    )
+    candidates = [path for path in result.stdout.splitlines() if path]
+    candidates += _untracked_component_paths(cwd=cwd)
+    return [
+        path
+        for path in dict.fromkeys(candidates)
+        if standalone_anchor_count(_read_head(path, cwd=cwd), marker) > 0
+    ]
+
+
+def _protected_component_dirs(
+    base_ref: str,
+    marker: str = MARKER,
+    cwd: str | Path | None = None,
+) -> set[str]:
+    """Component directories carrying a floor obligation at ``base_ref`` or head."""
+    marked = set(_discover_marked_files(base_ref, marker, cwd=cwd))
+    marked |= set(_discover_marked_files_head(marker, cwd=cwd))
+    return {
+        component
+        for component in (_component_dir(path) for path in marked)
+        if component is not None
+    }
+
+
 # ── Subcommands ──────────────────────────────────────────────────────────────
+
+def _tokens_for_run(base: str) -> tuple[list[str], str | None]:
+    """The token set this run enforces, plus a note when it was not read at
+    ``base``.
+
+    The enforced set is the base ref's declaration: a token added on the head
+    side is not yet enforced by that run, so a PR that widens the floor never
+    fails on its own widening. The one fallback is bootstrap - a base that
+    predates the token block, which is every base until the block lands - where
+    the working-tree declaration is used instead. Raises ``FloorTokenError``
+    when neither side declares a usable block.
+    """
+    try:
+        return _parse_token_block(_git_show(base, FLOOR_FILE)), None
+    except FloorTokenError as at_base:
+        tokens = _parse_token_block(_read_head(FLOOR_FILE))
+        return tokens, str(at_base)
+
 
 def cmd_markers(args: argparse.Namespace) -> int:
     base = args.base
-    files = args.files or list(MARKED_FILES)
+    try:
+        tokens, bootstrap = _tokens_for_run(base)
+    except FloorTokenError as exc:
+        print(f"FAIL {FLOOR_FILE}: {exc}")
+        return 1
+    if bootstrap:
+        print(
+            f"note {FLOOR_FILE} at {base}: {bootstrap}; enforcing the "
+            f"working-tree declaration instead (bootstrap)."
+        )
+    files = list(args.files) if args.files else _discover_marked_files(base, MARKER)
+    if not files:
+        print(f"ok   no marked files at {base}: no floor obligation is armed yet.")
+        return 0
+    renames = _get_renames(base)
     failed = False
     for path in files:
         base_text = _git_show(base, path)
-        head_text = _read_head(path)
-        removed = removed_tokens(base_text, head_text)
+        destination = renames.get(path)
+        if destination is not None and not _is_valid_component_path(destination):
+            # A rename git was happy to map, into a path no component can live
+            # at. That is a deletion wearing a rename, so say so and name the
+            # destination that was rejected.
+            failed = True
+            print(
+                f"FAIL {path}: marked file deleted -- renamed to "
+                f"{destination}, which is not a component path "
+                f"(skills/<x>/SKILL.md, plugins/<p>/skills/<x>/SKILL.md or "
+                f"commands/<x>.md), so the floor obligation was dropped, not moved"
+            )
+            continue
+        head_path = destination or path
+        head_text = _read_head(head_path)
+        if head_text is None and destination is None:
+            # Gone from head with nothing mapping it anywhere: a plain deletion.
+            failed = True
+            carried = sum(1 for t in tokens if base_text and t in base_text)
+            print(
+                f"FAIL {path}: marked file deleted between {base} and head "
+                f"({carried} floor obligation(s) lost, and no rename maps it to "
+                f"a new path)"
+            )
+            continue
+        removed = removed_tokens(base_text, head_text, tokens)
         if removed:
             failed = True
             for token in removed:
                 print(
-                    f"FAIL {path}: floor token weakened -> {token!r} "
+                    f"FAIL {head_path}: floor token weakened -> {token!r} "
                     f"(occurrences dropped, or its standalone anchor line was "
                     f"removed, between {base} and head)"
                 )
         else:
-            carried = [t for t in FLOOR_TOKENS if base_text and t in base_text]
+            carried = [t for t in tokens if base_text and t in base_text]
             state = f"{len(carried)} token(s) intact" if carried else "no floor tokens (ok)"
-            print(f"ok   {path}: {state}")
+            moved = f" (moved from {path})" if destination else ""
+            print(f"ok   {head_path}: {state}{moved}")
     if failed:
         print(
             "\nFloor markers were removed. Restore them, or obtain the "
@@ -194,17 +757,177 @@ def cmd_markers(args: argparse.Namespace) -> int:
     return 0
 
 
+def _changed_paths(args: argparse.Namespace) -> list[str]:
+    """The paths to classify: stdin with ``--changed``, else the base diff.
+
+    In diff mode the input is what the working tree changes relative to
+    ``--base``, which is ``git diff --name-only`` plus the component-shaped
+    paths that exist now and are not tracked -- the same reason
+    ``_untracked_component_paths`` exists. In CI the checkout is a merge commit
+    with nothing untracked, so that second half is empty there and the mode is
+    exactly the diff.
+    """
+    if args.changed:
+        paths = sys.stdin.read().splitlines()
+    else:
+        paths = subprocess.run(
+            ["git", "diff", "--name-only", args.base],
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        paths += _untracked_component_paths()
+    return list(dict.fromkeys(path.strip() for path in paths if path.strip()))
+
+
+def cmd_protected(args: argparse.Namespace) -> int:
+    """Print the protected subset of the changed paths, one per line.
+
+    Classification is not a verdict: a protected path is a path that needs the
+    expensive semantic layer and the maintainer's sign-off, not a failure. So
+    this exits 0 whenever it classified its input, and the caller decides what
+    an empty or non-empty answer means.
+    """
+    component_dirs = _protected_component_dirs(args.base)
+    for path in _changed_paths(args):
+        role = classify_path(path, component_dirs)
+        if role is None:
+            continue
+        if args.role and role != args.role:
+            continue
+        print(path)
+    return 0
+
+
+def _git_out(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=True
+    ).stdout
+
+
+# How the other changed paths are named in the sign-off count.
+_ROLE_LABELS = {
+    ROLE_CANARY: "canary",
+    ROLE_GATE_CODE: "gate code",
+    ROLE_MARKED_COMPONENT: "marked component",
+    None: "unprotected",
+}
+
+
+# How a `git diff --raw` status letter is named in the path list. A plain
+# modification (M) carries no label beyond its counts.
+_STATUS_LABELS = {"A": "added", "D": "deleted", "T": "type change"}
+
+
+def _raw_change(base: str, path: str) -> tuple[str, bool]:
+    """``path``'s status letter and whether its file mode changed.
+    ``--numstat`` counts lines only, so both are read from ``--raw``
+    (``:<old mode> <new mode> <old sha> <new sha> <status>``). A mode change
+    is a modification whose two modes differ; an added or deleted file has an
+    all-zero mode on one side, and a type change is named as one."""
+    raw = _git_out("diff", "--raw", "--no-renames", base, "HEAD", "--", path)
+    for line in raw.splitlines():
+        fields = line.lstrip(":").split()
+        if len(fields) >= 5:
+            status = fields[4][:1]
+            return status, status == "M" and fields[0] != fields[1]
+    return "M", False
+
+
+def _path_detail(base: str, path: str) -> tuple[str, bool]:
+    """``+<added> -<removed>`` for a text change, ``binary change`` for a
+    binary one, with ``added``, ``deleted``, ``type change`` or ``mode
+    change`` named alongside, each only when git reports it. The flag is True
+    only for a text modification with no other change: anything else vetoes
+    the pin-only verdict, since a pin diff cannot show it."""
+    numstat = _git_out("diff", "--numstat", "--no-renames", base, "HEAD", "--", path)
+    added, removed = "0", "0"
+    for line in numstat.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            added, removed = parts[0], parts[1]
+    status, mode = _raw_change(base, path)
+    parts = []
+    if added == "-":
+        parts.append("binary change")
+    elif added != "0" or removed != "0":
+        parts.append(f"+{added} -{removed}")
+    if status in _STATUS_LABELS:
+        parts.append(_STATUS_LABELS[status])
+    if mode:
+        parts.append("mode change")
+    if status == "A" and not (added != "0" or removed != "0"):
+        parts.append("empty")
+    pure_text = status == "M" and not mode and bool(parts) and added != "-"
+    return ", ".join(parts), pure_text
+
+
+def cmd_signoff_summary(args: argparse.Namespace) -> int:
+    """Print the sign-off explanation, or nothing when the floor core is untouched.
+
+    The changed paths are ``git diff --name-only <base> HEAD`` classified with
+    the roles of this copy of the script; CI runs the base ref's copy, so a
+    pull request that edits the classification is described by the rules it
+    is changing, and at worst counts a newly floor-core path among the others.
+    ``--head-commit`` only changes the commit the text cites: in CI ``HEAD`` is
+    the merge commit, and the approval covers the pull request's head.
+    """
+    base = args.base
+    component_dirs = _protected_component_dirs(base)
+    changed = [
+        path
+        for path in dict.fromkeys(_git_out("diff", "--name-only", base, "HEAD").splitlines())
+        if path
+    ]
+    roles = {path: classify_path(path, component_dirs) for path in changed}
+    floor_core = [path for path in changed if roles[path] == ROLE_FLOOR_CORE]
+    if not floor_core:
+        return 0
+    details = [(path, *_path_detail(base, path)) for path in floor_core]
+    pins = None
+    if all(has_hunk for _, _, has_hunk in details):
+        pins = pin_changes(
+            _git_out("diff", "-U0", "--no-renames", base, "HEAD", "--", *floor_core)
+        )
+    head = args.head_commit or _git_out("rev-parse", "HEAD").strip()
+    # Quote the clause as the base declares it, so a pull request that
+    # rewrites clause iii does not supply its own justification.
+    purpose = clause_iii_purpose(_git_show(base, FLOOR_FILE))
+    other_roles: dict[str, int] = {}
+    for path in changed:
+        if roles[path] != ROLE_FLOOR_CORE:
+            label = _ROLE_LABELS[roles[path]]
+            other_roles[label] = other_roles.get(label, 0) + 1
+    sys.stdout.write(
+        render_signoff_summary(
+            [(path, detail) for path, detail, _ in details], head, purpose, pins, other_roles
+        )
+    )
+    return 0
+
+
 def cmd_clauses(args: argparse.Namespace) -> int:
     floor_text = _read_head(args.floor)
     if floor_text is None:
         print(f"FAIL {args.floor} does not exist -- the floor file is mandatory.")
+        return 1
+    try:
+        tokens = _parse_token_block(floor_text)
+    except FloorTokenError as exc:
+        print(f"FAIL {args.floor}: {exc}")
+        print(
+            "The floor declares its tokens; removing or shrinking that block "
+            "narrows the check and needs the maintainer's out-of-band sign-off."
+        )
         return 1
     missing = missing_clauses(floor_text)
     if missing:
         print(f"FAIL {args.floor}: clauses not intact -> {', '.join(missing)}")
         print("Each clause needs its anchor comment and its key phrase.")
         return 1
-    print(f"ok   {args.floor}: all four clauses intact.")
+    print(
+        f"ok   {args.floor}: all four clauses intact, "
+        f"{len(tokens)} floor token(s) declared."
+    )
     return 0
 
 
@@ -219,9 +942,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--base", required=True, help="git ref for the merge-base (e.g. origin/main)"
     )
     p_markers.add_argument(
-        "--files", nargs="*", help="override the marked-file list (defaults to all)"
+        "--files",
+        nargs="*",
+        help="override the discovered marked-file set (defaults to discovery)",
     )
     p_markers.set_defaults(func=cmd_markers)
+
+    p_protected = sub.add_parser(
+        "protected", help="classify changed paths by protected directory role"
+    )
+    p_protected.add_argument(
+        "--base", required=True, help="git ref for the merge-base (e.g. origin/main)"
+    )
+    p_protected.add_argument(
+        "--changed",
+        action="store_true",
+        help="read the changed paths from stdin instead of diffing against --base",
+    )
+    p_protected.add_argument(
+        "--role",
+        choices=ROLES,
+        help="print only the paths in this role (default: every protected path)",
+    )
+    p_protected.set_defaults(func=cmd_protected)
+
+    p_signoff = sub.add_parser(
+        "signoff-summary",
+        help="explain a floor-core sign-off request (prints nothing when none is due)",
+    )
+    p_signoff.add_argument(
+        "--base", required=True, help="git ref for the merge-base (e.g. origin/main)"
+    )
+    p_signoff.add_argument(
+        "--head-commit",
+        help="commit the approval covers (default: git rev-parse HEAD); CI passes "
+        "the pull request's head because HEAD there is the merge commit",
+    )
+    p_signoff.set_defaults(func=cmd_signoff_summary)
 
     p_clauses = sub.add_parser("clauses", help="FLOOR.md four-clause integrity")
     p_clauses.add_argument("--floor", default=FLOOR_FILE, help="path to FLOOR.md")

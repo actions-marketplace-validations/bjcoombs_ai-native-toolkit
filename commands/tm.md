@@ -26,8 +26,8 @@ argument-hint: [tag [task-id] | feature description] (optional - derives context
 
 This command supplies the marathon skill's adapter as:
 - **enumerate** — `task-master tags use "<tag>" && task-master list --json`; use `jq` on `tasks.json` for reliable status filtering (`task-master next` can suggest subtask IDs of done parents).
-- **mark in-progress** — `task-master set-status --id=<id> --status=in-progress` (run sequentially inline — never as a parallel background job; concurrent TM writes race the global tag).
-- **close on merge** — `task-master tags use "<tag>" && task-master set-status --id=<id> --status=done`.
+- **mark in-progress** — `task-master set-status --project ~/dev/github.com/<org>/<repo> --id=<id> --status=in-progress` (run sequentially inline — never as a parallel background job; concurrent TM writes race the global tag). **Every TM write passes `--project <container root>`**: `set-status` has no `--tag`, the shell cwd persists across calls, and a write run from `<repo>-main/` or a worktree prints its banner but writes nothing. Re-read `tasks.json` after each write to confirm.
+- **close on merge** — `task-master tags use "<tag>" --project ~/dev/github.com/<org>/<repo> && task-master set-status --project ~/dev/github.com/<org>/<repo> --id=<id> --status=done` (same rule: sequentially inline, never in parallel - `tags use` switches the shared active tag, so an interleaved write lands on the wrong tag).
 - **branch / worktree** — branch `<tag>--<task-id>--<slug>`; worktree `worktree/<tag>/<task-id>--<slug>`.
 
 ---
@@ -327,7 +327,7 @@ task-master tags use "<tag>" && task-master list --ready --json
 
 ### Mode: Review (PR open)
 
-Use the pr-review-merge skill to drive PR #<number> to merge-ready (5 criteria, thread
+Use the pr-review-merge skill to drive PR #<number> to merge-ready (6 criteria, thread
 rules, background CI watcher). When all criteria are met, output `<promise>PR_READY</promise>`.
 
 ---
@@ -350,8 +350,11 @@ Before starting ANY marathon run - Agent Teams or Subagent Fallback, before the
 first task is decomposed - invoke the acceptance-contract start gate. The run
 identifier is the TM tag.
 
+The contract scripts live in the plugin package (`${CLAUDE_PLUGIN_ROOT}/scripts/contract/`), while the contract artifacts (contract, kill test, completion record) live in the target repository's `.taskmaster/contract/`, the scripts' default `--contract-dir`. When `CLAUDE_PLUGIN_ROOT` is unset (a hand-placed checkout rather than an installed plugin) the guard line before each invocation falls back to the current checkout.
+
 ```bash
-python scripts/contract/start_gate.py "<tag>"
+: "${CLAUDE_PLUGIN_ROOT:=.}"   # unset outside an installed plugin: fall back to the current checkout
+python "${CLAUDE_PLUGIN_ROOT}/scripts/contract/start_gate.py" "<tag>"
 ```
 
 The gate fails closed. Exactly two doors open a run; there is no silent third:
@@ -363,11 +366,11 @@ The gate fails closed. Exactly two doors open a run; there is no silent third:
   is capped, not free - the run is permanently capped at `UNVERIFIED` and can
   NEVER certify `PASS`.
 - **Neither** - non-zero exit. Do NOT start the run: freeze a contract
-  (`scripts/contract/freeze.py`) or record a signed skip first.
+  (`${CLAUDE_PLUGIN_ROOT}/scripts/contract/freeze.py`) or record a signed skip first.
 
 The exit-side gates are owned by the marathon skill, not this command. Marathon
-routes every verifier spawn through `scripts/contract/spawn_verifier.py` (the
-custody chokepoint) and blocks run-complete on `scripts/contract/complete_gate.py
+routes every verifier spawn through `${CLAUDE_PLUGIN_ROOT}/scripts/contract/spawn_verifier.py` (the
+custody chokepoint) and blocks run-complete on `${CLAUDE_PLUGIN_ROOT}/scripts/contract/complete_gate.py
 <tag>`. Start gate here, exit gates there - each fails closed. The
 `<!-- floor:cold-verify-completion -->` marker in this file's header makes this
 invocation un-removable: `floor.yml` reds any PR that drops the marker or any of

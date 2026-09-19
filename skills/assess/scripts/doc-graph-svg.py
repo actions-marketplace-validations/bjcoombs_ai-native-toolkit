@@ -52,7 +52,7 @@ from lib.doc_graph import (  # noqa: E402
     group_broken_links,
     radial_shells,
 )
-from lib.assess_config import resolve_excludes  # noqa: E402
+from lib.assess_config import load_working_notes_config, resolve_excludes  # noqa: E402
 from lib.doc_staleness import analyze_doc_staleness  # noqa: E402
 from lib.treemap_render import adaptive_cap, blend_to_grey, rgba_to_hex  # noqa: E402
 
@@ -67,8 +67,28 @@ COLOR_REACHABLE = "#009E73"  # Okabe-Ito bluish-green
 COLOR_ISLAND = "#E69F00"     # Okabe-Ito orange
 COLOR_ORPHAN = "#D55E00"     # Okabe-Ito vermillion
 EDGE_COLOR = "#9aa0a6"
+# Edge kinds. A link is a markdown link; a reference is a backticked doc path
+# that names a file on disk. A reference is drawn dotted: dashes already mean the
+# ghost tether (4,3) and the orphan and ghost rings (3,2), so a dot pattern is
+# the one line style left that collides with neither. Round caps add half the
+# stroke width to each end of a dash, so a near-zero dash paints a round dot and
+# the 4-unit gap keeps a visible break after the caps take their 1.6 units.
+_EDGE_STYLE = {
+    "link": {"stroke": EDGE_COLOR, "stroke-dasharray": None,
+             "stroke-width": "1.2", "opacity": "0.6"},
+    "reference": {"stroke": EDGE_COLOR, "stroke-dasharray": "0.1,4",
+                  "stroke-width": "1.6", "opacity": "0.8"},
+}
 ENTRY_RING = "#0072B2"       # blue ring marks the entry node when colour = staleness
 ORPHAN_RING = "#1a1a1a"      # dark dashed ring marks orphans when colour = staleness
+# A doc with no staleness measurement: white with grey hatching, outside the
+# OrRd ramp and the churn-blend grey, so it never reads as a measured value.
+UNMEASURED_FILL = "url(#unmeasured)"
+_UNMEASURED_PATTERN = (
+    '<pattern id="unmeasured" width="5" height="5" patternUnits="userSpaceOnUse" '
+    'patternTransform="rotate(45)"><rect width="5" height="5" fill="#ffffff"/>'
+    '<line x1="0" y1="0" x2="0" y2="5" stroke="#8c8c8c" stroke-width="1.6"/></pattern>'
+)
 GHOST_COLOR = "#CC79A7"      # Okabe-Ito reddish-purple: broken-link "ghost" nodes
 
 W, H = 1600.0, 1000.0
@@ -191,6 +211,32 @@ def _render_ghosts(broken_links: list[dict], pos: dict, radius,
     return "\n".join(out)
 
 
+def _normalize_edge_kind(kind: str) -> str:
+    """An edge with no kind, or an unknown one, draws as a link."""
+    return kind if kind in _EDGE_STYLE else "link"
+
+
+def _edge_attrs(kind: str) -> str:
+    """Presentation attributes for one edge kind; an unknown kind draws as a link."""
+    kind = _normalize_edge_kind(kind)
+    style = " ".join(f'{k}="{v}"' for k, v in _EDGE_STYLE[kind].items() if v is not None)
+    cap = ' stroke-linecap="round"' if _EDGE_STYLE[kind]["stroke-dasharray"] else ""
+    return f'{style}{cap}'
+
+
+def _edge_legend(mid: float, y: float) -> list[str]:
+    """One centred row with a sample line per edge kind, styled as the edges."""
+    items = [("link", "link"), ("reference", "reference (backticked path)")]
+    out: list[str] = []
+    x = mid - 150
+    for kind, label in items:
+        out.append(f'<line data-legend-kind="{kind}" x1="{x:.0f}" y1="{y - 4:.0f}" '
+                   f'x2="{x + 28:.0f}" y2="{y - 4:.0f}" {_edge_attrs(kind)}/>')
+        out.append(f'<text x="{x + 34:.0f}" y="{y:.0f}" font-size="13">{label}</text>')
+        x += 110
+    return out
+
+
 def render(result, out_path: Path, repo_root: Path, *, layout: str = "radial",  # noqa: C901  # SVG layout + colour-mode branching; ccn 18, ratchet target
            size_mode: str = "lines", colour: str = "staleness",
            staleness: dict | None = None, show_labels: bool = False) -> None:
@@ -222,15 +268,18 @@ def render(result, out_path: Path, repo_root: Path, *, layout: str = "radial",  
     cmap = plt.get_cmap(STALENESS_CMAP)
     days = {x: float(staleness.get(x, {}).get("last_commit_days") or 0) for x in nodes}
     churn = {x: float(staleness.get(x, {}).get("code_churn_in_window") or 0) for x in nodes}
-    day_cap, _ = adaptive_cap(list(days.values()))
-    churn_cap, _ = adaptive_cap(list(churn.values()))
+    # A node the staleness scan never measured (a `.claude/` doc a reference
+    # brought in) is hatched, not painted as if a 0d / zero-churn value were known.
+    unmeasured = {x: UNMEASURED_FILL for x in nodes if staleness and x not in staleness}
+    day_cap, _ = adaptive_cap([days[x] for x in nodes if x not in unmeasured])
+    churn_cap, _ = adaptive_cap([churn[x] for x in nodes if x not in unmeasured])
 
     def fill(node: str) -> str:
         if colour == "status":
             return _STATUS_COLOR[classify_node(node, entries, unreachable, orphans)]
         base = cmap(min(days[node] / day_cap, 1.0) if day_cap else 0.0)
         sat = (churn[node] / churn_cap) if churn_cap else 0.0
-        return rgba_to_hex(blend_to_grey(base, sat))
+        return unmeasured.get(node) or rgba_to_hex(blend_to_grey(base, sat))
 
     # Canvas: square-ish for the radial layout (it's circular, so a wide canvas
     # wastes the sides); wide for the web two-panel. Header = centred title;
@@ -297,7 +346,7 @@ def render(result, out_path: Path, repo_root: Path, *, layout: str = "radial",  
         )
 
     # Edges (drawn first, under the nodes). Pull the arrow back to the target rim.
-    for u, v in graph.edges():
+    for u, v, kind in graph.edges(data="kind", default="link"):
         if u not in pos or v not in pos:
             continue
         x1, y1 = pos[u]
@@ -307,8 +356,9 @@ def render(result, out_path: Path, repo_root: Path, *, layout: str = "radial",  
         rt = radius(v) + 3
         ex, ey = x2 - dx / dist * rt, y2 - dy / dist * rt
         parts.append(
-            f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{ex:.1f}" y2="{ey:.1f}" '
-            f'stroke="{EDGE_COLOR}" stroke-width="1.2" opacity="0.6" marker-end="url(#arrow)"/>'
+            f'<line data-edge-kind="{_normalize_edge_kind(kind)}" '
+            f'x1="{x1:.1f}" y1="{y1:.1f}" x2="{ex:.1f}" y2="{ey:.1f}" '
+            f'{_edge_attrs(kind)} marker-end="url(#arrow)"/>'
         )
 
     def size_text(node: str) -> str:
@@ -332,11 +382,13 @@ def render(result, out_path: Path, repo_root: Path, *, layout: str = "radial",  
             stroke, sw, dash = ORPHAN_RING, 1.8, ' stroke-dasharray="3,2"'
         else:
             stroke, sw = "#b8b8b8", 1.0
-        days_txt = f"{days[node]:.0f}d stale" if colour == "staleness" else ""
+        days_txt = "" if colour != "staleness" else (
+            "staleness not measured" if node in unmeasured
+            else f"{days[node]:.0f}d stale, subject churn {churn[node]:.0f}")
         tip = html.escape(
             f"{node}\n{size_text(node)} · in {in_deg.get(node, 0)} · "
             f"out {out_deg.get(node, 0)} · {status}"
-            + (f" · {days_txt}, subject churn {churn[node]:.0f}" if days_txt else ""),
+            + (f" · {days_txt}" if days_txt else ""),
             quote=False)
         parts.append(
             f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" fill="{fill(node)}" '
@@ -358,7 +410,7 @@ def render(result, out_path: Path, repo_root: Path, *, layout: str = "radial",  
     parts.append('</svg>')
     out_path.write_text("\n".join(parts), encoding="utf-8")
 
-    print(f"wrote {out_path}  ({n} docs, {graph.number_of_edges()} links, "
+    print(f"wrote {out_path}  ({n} docs, {graph.number_of_edges()} edges, "
           f"{result.island_count} islands)")
     print(f"orphan-rate {result.orphan_rate:.0%}  reachable-from-entry "
           f"{result.reachability_pct:.0%}  entries={sorted(entries)}")
@@ -380,7 +432,7 @@ def _title(result, n: int, cw: float) -> str:
     return "\n".join([
         f'<text x="{mid:.0f}" y="40" font-size="24" font-weight="600" '
         f'text-anchor="middle">Doc map — {n} docs, {result.graph.number_of_edges()} '
-        f'links, {result.island_count} islands</text>',
+        f'edges, {result.island_count} islands</text>',
         f'<text x="{mid:.0f}" y="66" font-size="14" fill="#555" text-anchor="middle">'
         f'{result.orphan_rate:.0%} orphaned · {result.reachability_pct:.0%} '
         f'reachable from the entry point'
@@ -402,15 +454,20 @@ def _legend(size_label: str, layout: str, colour: str, cw: float, ch: float,
         out.append(
             '<defs><linearGradient id="stalegrad" x1="0" y1="0" x2="1" y2="0">'
             '<stop offset="0" stop-color="#fff7ec"/><stop offset="0.5" stop-color="#fc8d59"/>'
-            '<stop offset="1" stop-color="#7f0000"/></linearGradient></defs>'
+            '<stop offset="1" stop-color="#7f0000"/></linearGradient>'
+            + _UNMEASURED_PATTERN + '</defs>'
         )
         # Row 1, centred: gradient (flanked by plain words, no arrow glyph that
         # some SVG renderers tofu) + entry + orphan markers.
-        gx = mid - 250
+        gx = mid - 330
         out.append(f'<text x="{gx - 6:.0f}" y="{y - 16:.0f}" font-size="12" fill="#555" '
                    'text-anchor="end">stable</text>')
         out.append(f'<rect x="{gx:.0f}" y="{y - 27:.0f}" width="110" height="12" rx="3" fill="url(#stalegrad)"/>')
         out.append(f'<text x="{gx + 116:.0f}" y="{y - 16:.0f}" font-size="12" fill="#555">lying map</text>')
+        ux = mid - 125
+        out.append(f'<circle cx="{ux:.0f}" cy="{y - 20:.0f}" r="8" fill="{UNMEASURED_FILL}" '
+                   'stroke="#b8b8b8" stroke-width="1"/>')
+        out.append(f'<text x="{ux + 14:.0f}" y="{y - 16:.0f}" font-size="13">not measured</text>')
         ex = mid + 10
         out.append(f'<circle cx="{ex:.0f}" cy="{y - 20:.0f}" r="8" fill="#dddddd" stroke="{ENTRY_RING}" stroke-width="3"/>')
         out.append(f'<text x="{ex + 14:.0f}" y="{y - 16:.0f}" font-size="13">entry</text>')
@@ -422,6 +479,7 @@ def _legend(size_label: str, layout: str, colour: str, cw: float, ch: float,
         out.append(f'<circle cx="{gh:.0f}" cy="{y - 20:.0f}" r="8" fill="#ffffff" stroke="{GHOST_COLOR}" '
                    'stroke-width="1.8" stroke-dasharray="3,2"/>')
         out.append(f'<text x="{gh + 14:.0f}" y="{y - 16:.0f}" font-size="13">ghost (broken link)</text>')
+        out.extend(_edge_legend(mid, y + 3))
         out.append(f'<text x="{mid:.0f}" y="{y + 20:.0f}" font-size="12" fill="#555" '
                    f'text-anchor="middle">colour = staleness · size = {size_label} · {struct}</text>')
         return "\n".join(out)
@@ -434,6 +492,7 @@ def _legend(size_label: str, layout: str, colour: str, cw: float, ch: float,
         out.append(f'<circle cx="{x + 6:.0f}" cy="{y - 4:.0f}" r="7" fill="{color}"/>')
         out.append(f'<text x="{x + 20:.0f}" y="{y:.0f}" font-size="13">{label}</text>')
         x += 34 + len(label) * 7.2
+    out.extend(_edge_legend(mid, y + 24))
     return "\n".join(out)
 
 
@@ -476,11 +535,14 @@ def main() -> int:
     # any `--exclude`) so the SVG and `lib.doc_graph` compute over the identical
     # doc set rather than reporting different doc counts for one run (issue #177).
     extra_dirs, extra_patterns = resolve_excludes(root, args.exclude)
+    working_notes = load_working_notes_config(root)
 
     result = build_doc_graph(
         root,
         extra_exclude_dirs=extra_dirs,
         extra_exclude_patterns=extra_patterns,
+        working_notes_dirs=working_notes.dirs,
+        working_notes_ignore=working_notes.ignore,
     )
     if not result.available:
         print(f"error: doc graph unavailable - {result.reason}", file=sys.stderr)

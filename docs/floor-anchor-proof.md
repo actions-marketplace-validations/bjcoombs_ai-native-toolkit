@@ -175,7 +175,10 @@ gh api "repos/$REPO/rulesets" --method POST --input - <<'JSON'
 JSON
 
 # 3. Create the anchor read token secret (fine-grained PAT, Administration: read).
+#    Actions and Dependabot read separate secret stores, so the same PAT is set
+#    twice; setting only the first leaves every Dependabot PR red on the anchor.
 gh secret set FLOOR_ANCHOR_TOKEN --repo "$REPO"   # paste the PAT when prompted
+gh secret set FLOOR_ANCHOR_TOKEN --repo "$REPO" --app dependabot   # paste the same PAT again
 ```
 
 ## Honest-degrade note (E2)
@@ -196,10 +199,12 @@ maintainer chose (per PRD E2) to **descope the floor.yml path lock**. The gap is
 handled as a *named, documented capability limit*, not shipped as if the lock
 were live:
 
-- The two hard requirements remain **fail-closed**: both `floor enforcement` and
-  `floor self-anchor` must be required status checks on the default branch, and
-  branch protection must be readable via `FLOOR_ANCHOR_TOKEN`. The
-  `floor self-anchor` job still fails the PR if either does not hold.
+- The three hard requirements remain **fail-closed**: both `floor enforcement`
+  and `floor self-anchor` must be required status checks on the default branch,
+  branch protection must be readable via `FLOOR_ANCHOR_TOKEN`, and clause iii's
+  `floor-signoff` environment must exist and be wired into `floor.yml` on the
+  floor-core trigger. The `floor self-anchor` job still fails the PR if any
+  does not hold.
 - The path-restriction check is **downgraded to a loud warning** (stderr
   `::warning::` + job summary) that quotes the 422 evidence and this descope
   decision. It is keyed on the explicit `PATH_LOCK_DESCOPED` constant in

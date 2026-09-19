@@ -175,8 +175,16 @@ def write_index(
     )
 
 
+def _short_run_id(run_id: str) -> str:
+    """The unique tail of a run id: the random suffix of the orchestrator's
+    ``YYYYMMDDHHMMSS-<8 hex>`` form (the date is already in the heading), or the
+    whole id when it has no ``-`` separator."""
+    return run_id.rsplit("-", 1)[-1] or run_id
+
+
 def _build_log_heading(
     *, run_date: str, plugin_version: str | None, existing: str,
+    run_id: str | None = None,
 ) -> str:
     """Build a unique `## ...` heading for a new log.md entry.
 
@@ -190,16 +198,40 @@ def _build_log_heading(
        don't collide and markdownlint MD024 stays quiet. Using local
        time matches `run_date` (which is also local), so a reader
        doesn't see a timezone mismatch.
+
+    When the entry carries a ``run_id`` its short form is always rendered
+    (``## YYYY-MM-DD (vX.Y.Z, run <id>)``): ``HH:MM`` cannot separate runs that
+    share a minute (#317), and the run id is unique per run. Two distinct ids can
+    still share the short suffix, so on a clash the full run id is rendered, and
+    a ``#N`` counter follows if even that heading exists. Without a run id the
+    legacy behaviour above is unchanged.
     """
+    parts = []
     if plugin_version:
-        base = f"## {run_date} (v{plugin_version})"
-    else:
-        base = f"## {run_date}"
+        parts.append(f"v{plugin_version}")
+    if run_id:
+        parts.append(f"run {_short_run_id(run_id)}")
+    base = f"## {run_date} ({', '.join(parts)})" if parts else f"## {run_date}"
     if base not in existing:
         return base
+    if run_id:
+        # A short id is unique per run in practice, but two ids can share an
+        # 8-hex suffix: fall back to the full run id, then a counter, so the
+        # heading is unique by construction rather than by probability.
+        full = base.replace(f"run {_short_run_id(run_id)}", f"run {run_id}", 1)
+        candidate, n = full, 2
+        while _heading_exists(candidate, existing):
+            candidate = f"{full[:-1]} #{n})"
+            n += 1
+        return candidate
     # Already an entry with this exact heading - disambiguate with time.
     stamp = datetime.now().strftime("%H:%M")
-    return f"{base[:-1]} {stamp})" if plugin_version else f"{base} {stamp}"
+    return f"{base[:-1]} {stamp})" if parts else f"{base} {stamp}"
+
+
+def _heading_exists(heading: str, existing: str) -> bool:
+    """True when ``heading`` is already a whole line of ``existing``."""
+    return heading in existing.splitlines()
 
 
 # --- log.md integrity chain (issue: assess-obey-thyself, task 11) -------------
@@ -300,6 +332,139 @@ def verify_log_chain(assess_dir: Path) -> tuple[bool, int | None]:
     return _verify_chain_text(log_path.read_text(encoding="utf-8"))
 
 
+# --- log entry targeting and re-chain (issue #355) ----------------------------
+#
+# The core writes each entry with placeholders the LLM finalize fills later. An
+# entry that still carries LOG_PLACEHOLDER belongs to a run that was never
+# finalized. Entries are addressed by the ``assess:run_id`` stamp they carry, and
+# any in-place change goes through ``rewrite_log_entry`` so the chain markers of
+# the changed entry and every later one are recomputed: an edit made by the tool
+# itself must not read as tampering on the next verify.
+LOG_PLACEHOLDER = "(LLM fills in)"
+_RUN_ID_STAMP_RE = re.compile(r"<!-- assess:run_id=(\S+) ")
+_HEADING_DATE_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2})", re.MULTILINE)
+
+
+def log_entry_is_unfinalized(content: str) -> bool:
+    """True when a log entry still carries the core's unfilled placeholders."""
+    return LOG_PLACEHOLDER in content
+
+
+def log_entry_run_id(content: str) -> str | None:
+    """The run id an entry's ``assess:run_id`` stamp names, or None (legacy)."""
+    m = _RUN_ID_STAMP_RE.search(content)
+    return m.group(1) if m else None
+
+
+def log_entry_owns_span(content: str, run_id: str) -> bool:
+    """True when the entry text begins with ``run_id``'s own stamp.
+
+    On a log written before the chain existed, the unchained legacy body and the
+    first chained entry parse as one span (see ``_chain_tail``). Such a span
+    carries the run's stamp but not at its start; removing or replacing it would
+    take the whole legacy history with it, so callers that drop an entry require
+    this to hold.
+    """
+    return content.startswith(f"<!-- assess:run_id={run_id} ")
+
+
+def log_entry_date(content: str) -> str | None:
+    """The ``YYYY-MM-DD`` date of an entry's first ``## `` heading, or None."""
+    m = _HEADING_DATE_RE.search(content)
+    return m.group(1) if m else None
+
+
+def read_log_entries(assess_dir: Path) -> list[str]:
+    """The entry texts of log.md in file order (chain markers stripped).
+
+    An index into this list is what ``rewrite_log_entry`` takes. A legacy log
+    with no chain markers reads as a single entry.
+    """
+    log_path = assess_dir / "log.md"
+    if not log_path.exists():
+        return []
+    return [c for c, _ in _parse_log_entries(log_path.read_text(encoding="utf-8"))]
+
+
+def find_log_entry(assess_dir: Path, run_id: str) -> int | None:
+    """Index of the log entry stamped with ``run_id``, or None."""
+    for i, content in enumerate(read_log_entries(assess_dir)):
+        if log_entry_run_id(content) == run_id:
+            return i
+    return None
+
+
+def rewrite_log_entry(assess_dir: Path, index: int, new_content: str | None) -> None:
+    """Replace (or, with ``None``, remove) log entry ``index`` and re-chain.
+
+    The chain is recomputed from the entry's predecessor: the rewritten entry and
+    every later one get fresh markers. Only entries whose stored marker verified
+    before the rewrite are re-stamped; the walk stops at the first entry that was
+    already broken, so a pre-existing break stays detectable rather than being
+    blessed by the re-chain.
+    """
+    log_path = assess_dir / "log.md"
+    text = log_path.read_text(encoding="utf-8")
+    entries = _parse_log_entries(text)
+    # Local validity before the rewrite: entry k verifies against entry k-1 alone.
+    prev = _GENESIS
+    was_valid: list[bool] = []
+    for content, stored in entries:
+        was_valid.append(stored is None or stored == _chain_hash(prev, content))
+        prev = stored if stored is not None else _chain_hash(prev, content)
+    if new_content is None:
+        del entries[index]
+        del was_valid[index]
+    else:
+        entries[index] = (new_content, entries[index][1])
+    out: list[str] = []
+    prev = _GENESIS
+    rechaining = True
+    for k, (content, stored) in enumerate(entries):
+        if k >= index and rechaining:
+            if not was_valid[k]:
+                rechaining = False
+            elif stored is not None:
+                stored = _chain_hash(prev, content)
+        out.append(content if stored is None else f"{content}<!-- chain:{stored} -->\n")
+        prev = stored if stored is not None else _chain_hash(prev, content)
+    header = _LOG_HEADER if text.startswith(_LOG_HEADER) else ""
+    log_path.write_text(header + "".join(out), encoding="utf-8")
+
+
+def last_log_entry_is_unfinalized_run(assess_dir: Path, run_id: str) -> bool:
+    """True when the log's last entry is ``run_id``'s own and still unfinalized.
+
+    This is the condition under which ``supersede_unfinalized_log_entry`` acts,
+    exposed so the core can learn before it writes the wiki that the previous
+    run was never finalized (#356).
+    """
+    return _last_entry_is_unfinalized_run(read_log_entries(assess_dir), run_id)
+
+
+def _last_entry_is_unfinalized_run(entries: list[str], run_id: str) -> bool:
+    if not entries:
+        return False
+    last = entries[-1]
+    return log_entry_owns_span(last, run_id) and log_entry_is_unfinalized(last)
+
+
+def supersede_unfinalized_log_entry(assess_dir: Path, run_id: str) -> bool:
+    """Remove the last log entry when it is ``run_id``'s and still unfinalized.
+
+    The caller decides the run is superseded (same date, same measured commit);
+    this only acts when the log's last entry is that run's and carries unfilled
+    placeholders. A finalized entry, or any entry that is not the last, is never
+    removed, and neither is a span that also holds unchained legacy history.
+    Returns True when an entry was removed.
+    """
+    entries = read_log_entries(assess_dir)
+    if not _last_entry_is_unfinalized_run(entries, run_id):
+        return False
+    rewrite_log_entry(assess_dir, len(entries) - 1, None)
+    return True
+
+
 def append_log_entry(assess_dir: Path, entry: LogEntry) -> None:
     """Append a dated entry to log.md (create the file if absent).
 
@@ -314,6 +479,7 @@ def append_log_entry(assess_dir: Path, entry: LogEntry) -> None:
         run_date=entry.run_date,
         plugin_version=entry.plugin_version,
         existing=existing,
+        run_id=entry.run_id,
     )
     snippet = _load_template("log_entry.md.template").format(
         heading=heading,
@@ -422,6 +588,11 @@ def write_hotspot_page(
 # graduated-hotspot idiom (a page that survives after the file leaves the top
 # list) rather than the deletion idiom, which the wiki has none of.
 RETIRED_STATUS = "retired - file deleted"
+# A file first flagged by a run that was never finalized, then excluded by
+# `.assess/config.toml` before the superseding run (#356). The file may still be
+# on disk, so this is a separate wording; every retired status begins "retired".
+RETIRED_EXCLUDED_STATUS = "retired - excluded before finalize"
+_RETIRED_PREFIX = "retired"
 
 # The source path a hotspot page describes lives in its `# Hotspot: `<path>``
 # heading (there is no YAML frontmatter). The status lives in the italic
@@ -459,19 +630,63 @@ def prune_orphan_hotspots(assess_dir: Path, repo_root: Path) -> list[str]:
         path = hotspot_page_source_path(content)
         if path is None:
             continue  # not a recognisable hotspot page - leave it alone
-        if hotspot_page_status(content) == RETIRED_STATUS:
-            continue  # already retired - idempotent
+        if is_retired_status(hotspot_page_status(content)):
+            continue  # already retired (for any reason) - idempotent
         if (repo_root / path).exists():
             continue  # source still on disk - a legitimate hotspot, untouched
-        banner = (
-            "\n> **Retired:** the source file was absent from disk at the latest "
+        _stamp_retired(page, content, RETIRED_STATUS, (
+            "the source file was absent from disk at the latest "
             "run (deleted, moved, or renamed). This page is preserved for history "
             "and no longer describes a live file."
-        )
-        stamped = _HOTSPOT_STATUS_RE.sub(
-            lambda m: f"{m.group('prefix')}{RETIRED_STATUS}{m.group('suffix')}{banner}",
-            content, count=1,
-        )
-        page.write_text(stamped, encoding="utf-8")
+        ))
         retired.append(path)
     return sorted(retired)
+
+
+def retire_excluded_hotspots(
+    assess_dir: Path, paths: list[str],
+) -> tuple[list[str], list[str]]:
+    """Stamp the pages of ``paths`` retired as excluded before finalize (#356).
+
+    The caller picks the paths: excluded by config and first flagged only by a
+    run that was never finalized. Returns ``(retired, unstamped)``, both sorted:
+    the paths whose page this call retired, and the paths whose page exists but
+    carries no status token to stamp (left as-is, so the caller can keep their
+    first-flagged entries). A path with no page, or whose page is already
+    retired, is in neither list.
+    """
+    retired: list[str] = []
+    unstamped: list[str] = []
+    for path in sorted(set(paths)):
+        page = assess_dir / "hotspots" / f"{slug_for_path(path)}.md"
+        if not page.exists():
+            continue
+        content = page.read_text(encoding="utf-8")
+        status = hotspot_page_status(content)
+        if status is None:
+            unstamped.append(path)
+            continue
+        if is_retired_status(status):
+            continue
+        _stamp_retired(page, content, RETIRED_EXCLUDED_STATUS, (
+            "this file was first flagged by a run that was never finalized and "
+            "is now excluded by `.assess/config.toml`. This page is preserved for "
+            "history and no longer describes a live hotspot."
+        ))
+        retired.append(path)
+    return retired, unstamped
+
+
+def is_retired_status(status: str | None) -> bool:
+    """True for any retired status token: every one begins with ``retired``."""
+    return status is not None and status.startswith(_RETIRED_PREFIX)
+
+
+def _stamp_retired(page: Path, content: str, status: str, reason: str) -> None:
+    """Flip the page's status token to ``status`` and add a retirement banner."""
+    banner = f"\n> **Retired:** {reason}"
+    stamped = _HOTSPOT_STATUS_RE.sub(
+        lambda m: f"{m.group('prefix')}{status}{m.group('suffix')}{banner}",
+        content, count=1,
+    )
+    page.write_text(stamped, encoding="utf-8")

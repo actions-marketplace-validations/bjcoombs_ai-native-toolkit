@@ -12,6 +12,36 @@
 #     2. FLOOR.md four-clause integrity (unconditional -- FLOOR.md exists from the
 #        PR that introduced this workflow onward).
 #
+#   floor sign-off (clause iii, the named approval artefact):
+#     A deployment-review gate on the `floor-signoff` GitHub Environment, whose
+#     sole required reviewer is the repository owner. It is requested only when
+#     the path filter reports that the PR changes the floor's own core -- the
+#     same classification call the canary layer keys off, asked for one role, so
+#     this file still learns no path. The approval is a click in the deployments
+#     UI with an actor and a timestamp GitHub records OUTSIDE the diff, which is
+#     what makes it an artefact the PR under review cannot forge.
+#     It adds no required status check. `floor enforcement` needs it and runs on
+#     every non-cancelled outcome (`if: ${{ !cancelled() }}`, no result
+#     conjunct): a skipped `needs` job would otherwise propagate and let a PR go
+#     green with the deterministic layer never having run, and a `!= 'failure'`
+#     conjunct would do the same in exactly the case the sign-off exists to
+#     stop. So a refusal is converted into a RED required context by the first
+#     step of `floor enforcement` rather than an absent one. A sign-off that
+#     was never REQUESTED is caught the same way: when the filter reports the
+#     floor core changed and the sign-off job's result is anything but
+#     success (skipped, because its `if:` was edited away from that output),
+#     `floor enforcement` goes red instead of letting the review lapse. The
+#     self-anchor pins the trigger from the other side, asserting the sign-off
+#     job's `if:` is exactly the filter's floor_core_changed answer.
+#     Before the review is requested, the `floor sign-off summary` job tells
+#     the maintainer what the approval covers: clause iii, each floor-core
+#     path with its line counts, the pull request's head commit, and, for a
+#     pin-only change, each action's old and new commit. The text comes from
+#     the base ref's copy of scripts/floor_check.py (the trigger's
+#     classification, as it stood before this pull request) and goes to the
+#     run's step summary and to one pull-request comment, updated in place. A
+#     read-only token (Dependabot, forks) skips the comment only.
+#
 #   floor self-anchor (E2, fail-closed on repo settings):
 #     Query the live GitHub API and FAIL (fail-closed) if either floor check
 #     (floor enforcement / floor self-anchor) is no longer required on the
@@ -31,11 +61,18 @@
 #   canary suite (E3, semantic layer -- conditional):
 #     Runs scripts/canaries/run_canaries.py, which drives the REAL gates against
 #     the committed and per-run blind fixtures (no mocks). It is the expensive
-#     semantic layer, so it runs only on PRs that touch the workflow skills or the
-#     gate/canary code (skills/marathon/, skills/pr-review-merge/, commands/tm.md,
-#     commands/issues.md, scripts/contract/, scripts/canaries/, tests/canaries/, and
-#     floor.yml itself, so a change to the wiring re-runs the canaries) -- a `canary
-#     path filter` job diffs the PR against its base and gates it. On a
+#     semantic layer, so it runs only on PRs that touch a protected path -- a
+#     `canary path filter` job diffs the PR against its base and asks
+#     scripts/floor_check.py which of the changed paths are protected. This
+#     workflow holds NO path list of its own. Protection is decided by directory
+#     ROLE: a marked component and everything beneath it, the gate code the suite
+#     drives, the canary code and its fixtures, and the floor's own machinery
+#     (this file included, so a change to the wiring re-runs the canaries). The
+#     roles are computed from the floor's own markers and directory layout, so a
+#     component that moves or arrives keeps its coverage with no edit here. The
+#     previous mechanism was a path regex maintained by hand in this file: a
+#     second source of truth that any layout change would silently narrow, and
+#     that named files the floor itself no longer names. On a
 #     non-touching PR the suite job is skipped (neutral, never blocks). On a
 #     touching PR it retries ONCE on failure (a real infra/model flake is re-run)
 #     and then stays red -- it is never auto-skipped. The deterministic internals
@@ -59,16 +96,57 @@ permissions:
 jobs:
   floor:
     name: floor enforcement
+    # The sign-off gate runs first when the floor core changed. `!cancelled()`
+    # alone is deliberate: a skipped or failed sign-off must never skip this
+    # required context, because branch protection reads an absent context as
+    # satisfied. Refusal is turned into a job failure by the first step below.
+    # `canary-changes` is in `needs` as well as `signoff`, and for the same
+    # reason the guard is bare: every way the sign-off can fail to happen has
+    # to arrive here as RED, never as absent. A failed filter job would
+    # otherwise leave `signoff` SKIPPED -- not `failure` -- and the refusal
+    # step below would wave it through, so a PR that merely breaks the
+    # classification (dropping a role from floor_check.py is enough) would
+    # delete the sign-off and merge green.
+    needs: [signoff, canary-changes]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
+      - name: Fail on a refused sign-off
+        if: needs.signoff.result == 'failure'
+        run: |
+          echo "::error::The maintainer REFUSED the floor sign-off deployment review for this pull request. A change to the floor core takes effect only with that approval (FLOOR.md clause iii), so this required check is red rather than absent."
+          exit 1
+
+      - name: Fail on an unclassified path filter
+        if: needs.canary-changes.result != 'success'
+        run: |
+          echo "::error::The path-filter job did not succeed (result: ${{ needs.canary-changes.result }}), so no floor-core sign-off could be requested and the 'floor sign-off' job was skipped rather than refused. A sign-off that never ran is not an approval: this required check is red until the classification runs."
+          exit 1
+
+      # The filter said the floor core changed, so a review MUST have been
+      # requested and approved. Any other sign-off result here (skipped is the
+      # one this exists for: a PR that re-keys the sign-off job's `if:` away
+      # from floor_core_changed skips the review without refusing it) is the
+      # review lapsing silently, and is converted into RED the same way a
+      # refusal is. The self-anchor asserts this step and the trigger it
+      # mirrors, so neither can be edited away unnoticed.
+      - name: Fail on a floor-core change with no approved sign-off
+        if: needs.canary-changes.outputs.floor_core_changed == 'true' && needs.signoff.result != 'success'
+        run: |
+          echo "::error::The path filter reports the floor core changed, but the 'floor sign-off' job's result is '${{ needs.signoff.result }}', not success. A change to the floor core takes effect only with the maintainer's deployment review (FLOOR.md clause iii); a sign-off that was never requested is not an approval, so this required check is red rather than green."
+          exit 1
+
       - name: Check out the repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0  # full history so the merge-base is resolvable
           persist-credentials: false
 
+      # NO --depth=1 here. The checkout above is unshallow on purpose, and a
+      # shallow fetch into it writes a graft that truncates the base branch's
+      # ancestry at its tip -- exactly where `git merge-base` below has to walk.
       - name: Fetch the PR base branch
-        run: git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+        run: git fetch --no-tags origin "${{ github.base_ref }}"
 
       - name: Marker removal detection (base-vs-head)
         run: |
@@ -89,12 +167,197 @@ jobs:
             echo "The repo-settings anchor is checked separately by the \`floor self-anchor\` job."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ------------------------------------------------------------------------- #
+  # Clause-iii layer: the named sign-off artefact. `environment:` makes GitHub
+  # request a deployment review from that environment's required reviewers (the
+  # repository owner, its sole reviewer) and hold this job until one of them
+  # approves or rejects. The condition comes from the `canary path filter` job
+  # defined below, asked for the floor-core role alone -- so the decision is the
+  # script's, not this file's. On every other pull request this job is skipped
+  # and no review is requested.
+  signoff:
+    name: floor sign-off
+    needs: [canary-changes, signoff-summary]
+    if: needs.canary-changes.outputs.floor_core_changed == 'true'
+    environment: floor-signoff
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record the approval
+        run: |
+          echo "Floor sign-off APPROVED by the maintainer's deployment review."
+          echo "That review -- its actor and timestamp recorded by GitHub outside"
+          echo "the diff -- is the out-of-band approval FLOOR.md clause iii requires."
+
+  # ------------------------------------------------------------------------- #
+  # What the maintainer is asked to approve. Runs on the same trigger as the
+  # sign-off and sits in its `needs`, so the explanation is on the run summary
+  # (and the pull request) before the deployment review is requested. The text
+  # is the script's, so this file still names no path. It is rendered by the
+  # base ref's copy while the trigger runs the head copy (never the head copy
+  # here, where a later step holds a write token): the two agree unless
+  # the pull request edits the classification itself, and then the section
+  # still appears (floor_check.py is floor core in the base copy that renders
+  # it) and at worst counts a newly floor-core path among the other paths,
+  # by role. It cites the pull
+  # request's head commit: the checkout is the merge commit, which is not what
+  # the maintainer approves.
+  # This is the one floor job with a write scope. On the `pull_request` event
+  # a fork's GITHUB_TOKEN is read-only whatever `permissions:` says, so the
+  # write is reachable only from a branch in this repository (a collaborator);
+  # there is no `pull_request_target` and no secret in the job.
+  signoff-summary:
+    name: floor sign-off summary
+    needs: [canary-changes]
+    if: needs.canary-changes.outputs.floor_core_changed == 'true'
+    runs-on: ubuntu-latest
+    # One comment writer per pull request at a time, so two runs cannot both
+    # find no comment and both post, or an older run overwrite a newer head.
+    # Job-level, not workflow-level: a run held at the deployment review must
+    # not queue the next push's floor jobs behind it. GitHub keeps one pending
+    # job per group, so on quick successive pushes a middle run's job is
+    # cancelled; that run's `floor enforcement` then goes red on a superseded
+    # head, which branch protection does not read. Noise, not a floor cause.
+    concurrency:
+      group: floor-signoff-comment-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0  # full history so the merge-base is resolvable
+          persist-credentials: false
+
+      # NO --depth=1 here, for the same reason as the path filter's fetch.
+      # The branch name reaches the shell through env, never through template
+      # expansion, since this job holds a write scope.
+      - name: Fetch the PR base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags origin "${BASE_REF}"
+
+      - name: Write the sign-off explanation to the step summary
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
+        run: |
+          BASE_SHA="$(git merge-base "origin/${BASE_REF}" HEAD)"
+          echo "merge-base: ${BASE_SHA}"
+          SUMMARY="${RUNNER_TEMP}/floor-signoff-summary.md"
+          # Render with the BASE copy of the script: the head copy is floor
+          # core this pull request may itself change, and the approver should
+          # not read an account of a change written by that change. Nor does
+          # this job ever run the head copy: code run here could write
+          # GITHUB_ENV or GITHUB_PATH and so reach the next step, which holds
+          # the write token. When the base predates the subcommand, a fixed
+          # notice stands in for the explanation.
+          RENDERER="${RUNNER_TEMP}/floor_check_base.py"
+          if git show "${BASE_SHA}:scripts/floor_check.py" > "${RENDERER}" 2> /dev/null \
+              && python "${RENDERER}" signoff-summary --help > /dev/null 2>&1; then
+            echo "Rendering with scripts/floor_check.py at the base ${BASE_SHA}."
+            python "${RENDERER}" signoff-summary \
+              --base "${BASE_SHA}" --head-commit "${HEAD_COMMIT}" > "${SUMMARY}"
+          else
+            echo "::warning::The base ${BASE_SHA} has no signoff-summary subcommand, so a fixed notice replaces the explanation."
+            {
+              echo "## Floor sign-off requested"
+              echo ""
+              echo "This pull request changes the floor's own enforcement, so it waits on the maintainer's deployment review of the \`floor-signoff\` environment."
+              echo ""
+              echo "**Why:** FLOOR.md clause iii. Changes to the floor require the maintainer's out-of-band sign-off."
+              echo ""
+              echo "**Head commit the approval covers:** \`${HEAD_COMMIT}\`"
+              echo ""
+              echo "**No explanation was rendered.** The base \`${BASE_SHA}\` predates the sign-off renderer, and this job does not run the pull request's own copy of it. The paths below are every path the pull request changes, as git reports them, not classified: read the full diff before approving."
+              echo ""
+              # A path is pull-request text: a plain one goes in a code span,
+              # any other has every ASCII punctuation character escaped.
+              git diff --numstat --no-renames "${BASE_SHA}" HEAD \
+                | while IFS="$(printf '\t')" read -r ADDED REMOVED CHANGED_PATH; do
+                    if printf '%s' "${CHANGED_PATH}" | grep -Eq '^[A-Za-z0-9_.+/@-]+$'; then
+                      SHOWN="\`${CHANGED_PATH}\`"
+                    else
+                      SHOWN="$(printf '%s' "${CHANGED_PATH}" | sed 's/[][!"#$%&'"'"'()*+,./:;<=>?@\\^_`{|}~-]/\\&/g')"
+                    fi
+                    if [ "${ADDED}" = "-" ]; then
+                      echo "- ${SHOWN} binary change"
+                    else
+                      echo "- ${SHOWN} +${ADDED} -${REMOVED}"
+                    fi
+                  done
+              echo ""
+              echo "**Approving** asserts that these changes to the floor's own enforcement are intended."
+              echo ""
+              echo "**Rejecting** turns the required \`floor enforcement\` check red, so the pull request cannot merge."
+            } > "${SUMMARY}"
+          fi
+          cat "${SUMMARY}"
+          cat "${SUMMARY}" >> "$GITHUB_STEP_SUMMARY"
+
+      # One comment per pull request, found by its hidden marker and author and
+      # updated in place on later pushes and re-runs. A failed read posts
+      # nothing (a blind POST is how a second comment appears); a refused write
+      # (most often the read-only token Dependabot and fork pull requests run
+      # with) is logged with its error, and the step summary above stands
+      # alone. Neither fails the job: the review is what gates, and it must
+      # still be requested.
+      - name: Post or update the sign-off comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # A step with no `shell:` runs as `bash -e` without pipefail, which
+          # would hide a failed `gh api` behind jq's exit 0 and reach the POST.
+          set -o pipefail
+          SUMMARY="${RUNNER_TEMP}/floor-signoff-summary.md"
+          if [ ! -s "${SUMMARY}" ]; then
+            # The base advanced between the path filter and this job and the
+            # floor-core set came back empty: post nothing rather than a blank.
+            echo "::warning::The sign-off explanation is empty, so the comment was skipped."
+            exit 0
+          fi
+          MARKER="<!-- floor-signoff-summary -->"
+          BODY="${RUNNER_TEMP}/floor-signoff-comment.md"
+          { echo "${MARKER}"; cat "${SUMMARY}"; } > "${BODY}"
+          if ! EXISTING="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              | jq -s -r --arg m "${MARKER}" 'add // [] | map(select(.user.login == "github-actions[bot]" and (.body | contains($m)))) | .[0].id // empty')"; then
+            echo "::warning::Could not read the pull request's comments, so the sign-off comment was skipped; the step summary stands alone."
+            exit 0
+          fi
+          # A delayed run or a re-run of an older push must not overwrite the
+          # comment with an older head: write only while this run's head is
+          # still the pull request's head.
+          if ! LIVE_HEAD="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -r '.head.sha')"; then
+            echo "::warning::Could not read the pull request's live head, so the sign-off comment was skipped; the step summary stands alone."
+            exit 0
+          fi
+          if [ "${LIVE_HEAD}" != "${HEAD_COMMIT}" ]; then
+            echo "::warning::This run explains ${HEAD_COMMIT}, but the pull request's head is now ${LIVE_HEAD}; the comment is left to that newer run."
+            exit 0
+          fi
+          ERR="${RUNNER_TEMP}/floor-signoff-comment.err"
+          if [ -n "${EXISTING}" ]; then
+            if gh api --method PATCH "repos/${REPO}/issues/comments/${EXISTING}" -F body=@"${BODY}" > /dev/null 2> "${ERR}"; then
+              echo "Updated the sign-off comment ${EXISTING} in place."
+            else
+              echo "::warning::Updating the sign-off comment ${EXISTING} failed, so it was skipped and the step summary stands alone: $(tr '\n' ' ' < "${ERR}")"
+            fi
+          elif gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@"${BODY}" > /dev/null 2> "${ERR}"; then
+            echo "Posted the sign-off comment."
+          else
+            echo "::warning::Posting the sign-off comment failed, so it was skipped and the step summary stands alone. The likely cause is a read-only token (Dependabot or fork pull request): $(tr '\n' ' ' < "${ERR}")"
+          fi
+
   self-anchor:
     name: floor self-anchor
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
@@ -108,43 +371,65 @@ jobs:
         run: python scripts/floor_anchor.py
 
   # ------------------------------------------------------------------------- #
-  # Semantic layer (E3): the canary suite. Expensive, so gated to PRs that
-  # touch the workflow skills or the gate/canary code. The path filter diffs the
-  # PR against its merge-base with the base branch (the same base-vs-head
-  # mechanism the deterministic layer uses -- no new third-party action), rather
-  # than a workflow-level `paths:` trigger, because floor.yml must keep running
-  # on ALL PRs for the two jobs above.
+  # Semantic layer (E3): the canary suite. Expensive, so gated to PRs that touch
+  # a protected path. The path filter diffs the PR against its merge-base with
+  # the base branch (the same base-vs-head mechanism the deterministic layer
+  # uses -- no new third-party action), rather than a workflow-level `paths:`
+  # trigger, because floor.yml must keep running on ALL PRs for the two jobs
+  # above. The classification itself is not made here: it is a call to the same
+  # script the deterministic layer runs.
   canary-changes:
     name: canary path filter
     runs-on: ubuntu-latest
     outputs:
       run_canaries: ${{ steps.filter.outputs.run_canaries }}
+      floor_core_changed: ${{ steps.filter.outputs.floor_core_changed }}
     steps:
       - name: Check out the repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0  # full history so the merge-base is resolvable
           persist-credentials: false
 
+      # NO --depth=1 here. The checkout above is unshallow on purpose, and a
+      # shallow fetch into it writes a graft that truncates the base branch's
+      # ancestry at its tip -- exactly where `git merge-base` below has to walk.
       - name: Fetch the PR base branch
-        run: git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+        run: git fetch --no-tags origin "${{ github.base_ref }}"
 
-      - name: Detect changes to workflow-skill / gate paths
+      - name: Detect changes to protected paths
         id: filter
         run: |
           BASE_SHA="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
           echo "merge-base: ${BASE_SHA}"
-          # Paths that carry a floor obligation, drive the gates the canary suite
-          # exercises, or wire the suite itself (floor.yml -- so a change to the
-          # canary invocation re-runs the canaries and proves the wiring). This is
-          # the file set FLOOR.md clause iii protects; keep the two in sync.
-          if git diff --name-only "${BASE_SHA}" HEAD \
-            | grep -qE '^(skills/marathon/|skills/pr-review-merge/|commands/tm\.md$|commands/issues\.md$|scripts/contract/|scripts/canaries/|tests/canaries/|\.github/workflows/floor\.yml$)'; then
+          # The one path decision this workflow makes, and it delegates it: the
+          # script classifies each changed path by directory role and echoes back
+          # the protected subset. Whether that subset is empty is the only thing
+          # read here, so this file never learns a path.
+          CHANGED="${RUNNER_TEMP}/floor-changed-paths.txt"
+          git diff --name-only "${BASE_SHA}" HEAD > "${CHANGED}"
+          PROTECTED="$(python scripts/floor_check.py protected \
+            --base "${BASE_SHA}" --changed < "${CHANGED}")"
+          if printf '%s\n' "${PROTECTED}" | grep -q .; then
             echo "run_canaries=true" >> "$GITHUB_OUTPUT"
-            echo "Workflow-skill / gate paths changed: canary suite WILL run."
+            echo "Protected paths changed: canary suite WILL run."
+            printf '%s\n' "${PROTECTED}"
           else
             echo "run_canaries=false" >> "$GITHUB_OUTPUT"
-            echo "No workflow-skill / gate paths changed: canary suite will be skipped."
+            echo "No protected paths changed: canary suite will be skipped."
+          fi
+          # The same delegated decision, asked for one role: a change to the
+          # floor's own core is what needs the maintainer's sign-off (clause
+          # iii). Same script, same base, so the two answers cannot drift.
+          FLOOR_CORE="$(python scripts/floor_check.py protected \
+            --base "${BASE_SHA}" --changed --role floor-core < "${CHANGED}")"
+          if printf '%s\n' "${FLOOR_CORE}" | grep -q .; then
+            echo "floor_core_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Floor core changed: a maintainer sign-off WILL be requested."
+            printf '%s\n' "${FLOOR_CORE}"
+          else
+            echo "floor_core_changed=false" >> "$GITHUB_OUTPUT"
+            echo "Floor core untouched: no sign-off requested."
           fi
 
   canary-suite:
@@ -154,12 +439,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
 
       # The interactive fixtures need a JS runtime to drive them; without one the
       # harness reports criteria 1/2b as NOT-RUN and fails closed. ubuntu-latest
@@ -197,6 +482,6 @@ jobs:
             echo "## Floor canary suite (semantic layer): PASS"
             echo ""
             echo "The real freeze / cold-exit / complete gates certified the committed"
-            echo "and per-run blind fixtures. This job ran because the PR touched the"
-            echo "workflow skills or the gate/canary code."
+            echo "and per-run blind fixtures. This job ran because the PR touched a"
+            echo "path the floor classifies as protected."
           } >> "$GITHUB_STEP_SUMMARY"

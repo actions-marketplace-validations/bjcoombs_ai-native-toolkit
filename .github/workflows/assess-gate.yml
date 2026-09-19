@@ -21,12 +21,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0  # full history so the churn window is accurate
           persist-credentials: false  # nothing here pushes; don't leave a token in .git
 
       - name: Run the AI-readiness gate (this branch's action)
+        id: assess-action
         uses: ./
         with:
           config: .assess/config.toml
+
+      # The composite keeps `continue-on-error` on its render step so a
+      # consumer's PR never reddens on infrastructure. That degrade is right for
+      # consumers and wrong here: this workflow IS the action's self-test, and a
+      # render that fell over would otherwise ship as a notice nobody reads.
+      # Asserting on 'failure' rather than on 'success' keeps a render skipped
+      # for want of uv green - a skip is infrastructure, a failure is a defect.
+      - name: Assert render did not fail
+        if: steps.assess-action.outputs.rendered == 'failure'
+        run: |
+          echo "::error::The assess action's render step failed on this branch - the composite could not render the deterministic snapshot. See the 'Render the deterministic snapshot' step above."
+          exit 1

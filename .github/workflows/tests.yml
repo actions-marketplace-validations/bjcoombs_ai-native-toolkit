@@ -18,10 +18,10 @@ jobs:
     name: skills/assess pytest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
 
       # The promissory-marker scan shells out to ripgrep; without it the scan
       # honestly degrades to "rg not on PATH" and its fixture tests cannot
@@ -29,18 +29,22 @@ jobs:
       - name: Install ripgrep
         run: sudo apt-get update -q && sudo apt-get install -y -q ripgrep
 
+      # --with pyyaml: eight structural guards in tests/test_action_contract.py
+      # parse action.yml / assess-gate.yml and pytest.skip without PyYAML - a
+      # skipped guard is a decorative guard. skills/assess/pyproject.toml does
+      # not declare it, so the CI invocation supplies it.
       - name: Run pytest
-        run: uv run --with pytest pytest -v
+        run: uv run --with pytest --with pyyaml pytest -v
         working-directory: skills/assess
 
   pipeline-tests:
     name: scripts/ pytest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
 
       - name: Run pytest
         run: uv run --with pytest pytest -v
@@ -50,10 +54,26 @@ jobs:
     name: plugin contract pytest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      # Full history: the contract tests reason about the diff against the PR
+      # base (a same-PR version bump, a changelog entry), which a shallow
+      # checkout cannot see. Read-only job, so the token is not persisted.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # fetch-depth: 0 deepens the merge ref, it does not create the base
+      # branch ref locally. Fetch it explicitly so `origin/<base>` resolves.
+      # No --depth: a depth-limited fetch into a complete clone writes a
+      # .git/shallow graft at the fetched tip, cutting the base's ancestry so
+      # `git merge-base` cannot resolve past it. fetch-depth: 0 already paid
+      # for the full history.
+      - name: Fetch the PR base ref
+        if: github.event_name == 'pull_request'
+        run: git fetch --no-tags origin "${{ github.base_ref }}"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
 
       - name: Run pytest
         run: uv run --with pytest pytest -v tests/
@@ -65,12 +85,12 @@ jobs:
       # Read-only job: don't persist the checkout token for later steps
       # (defense-in-depth; the workflow already restricts permissions to
       # contents: read).
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
 
       # Layer 3 complexity ratchet + pyflakes/pycodestyle gate (issue #77).
       # Config (threshold, exclusions, per-function noqa) lives in each

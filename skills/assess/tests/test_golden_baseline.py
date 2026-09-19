@@ -10,6 +10,7 @@ decomposition work depends on it.
 from __future__ import annotations
 
 import golden
+from lib import keyhole_signals as ks
 
 # Blocks the report's prose sections read from run-context.json. The test
 # strategy for task 1 names these explicitly: a golden missing any of them would
@@ -281,10 +282,14 @@ def test_golden_run_context_has_test_focus_and_coverage_shape() -> None:
         assert entry["risk_band"] in {"high", "medium", "low"}
         assert entry["test_signal"] in {
             "no_covering_test", "covered_but_hollow",
-            "unknown_no_coverage", "covered_clean",
+            "unknown_no_coverage", "covered_clean", "unsupported",
+            "sibling_test_only",
         }
+        # The orchestrator always passes repo_root, so the no-repo_root degrade
+        # can no longer reach the golden.
+        assert entry["test_signal"] != "unknown_no_coverage"
         assert entry["suggested_action"] in {
-            "add_tests", "strengthen_assertions", "none",
+            "add_tests", "strengthen_assertions", "measure_coverage", "none",
         }
 
     cov = ctx["coverage_report"]
@@ -303,10 +308,15 @@ def test_report_renders_where_to_focus_testing_table() -> None:
 
     assert "#### Where to focus testing" in folded
     assert "| File | Risk | Test Signal | Suggested Action |" in folded
-    # The golden is a no-coverage run, so every row maps to the Unknown label.
-    assert "Unknown (no coverage)" in folded
-    assert "Add tests" in folded
+    # The golden is a no-coverage run with repo_root passed (the orchestrator
+    # always passes it), so no row can carry the Unknown label; every hot file in
+    # this repo has a conventionally named test file.
+    assert "Test file present, coverage unmeasured" in folded
+    assert "Measure coverage" in folded
+    assert "Unknown (no coverage)" not in report
     # Raw schema values must be mapped, never rendered verbatim into the table.
+    assert "sibling_test_only" not in report
+    assert "measure_coverage" not in report
     assert "unknown_no_coverage" not in report
     assert "add_tests" not in report
     # The verbose section lives in a fold, never on the human surface.
@@ -337,3 +347,21 @@ def test_agent_assess_block_is_not_duplicated() -> None:
     """
     report = golden.load_golden_report()
     assert report.count("the `.assess/` directory is actionable feedback written for you") == 1
+
+
+def test_golden_attention_tie_break_order() -> None:
+    """The stored attention rows agree with the tie-break key, and no
+    non-hotspot row sits directly above a hotspot row of equal score. The
+    golden's rows are five score-1 hidden_coupling directories (none a hotspot),
+    so this pins the coupling arm only: skills/assess/tests (containment 0.0357)
+    stays last and the stored order did not move. The marker arm is covered by
+    the unit tests; run-context carries no marker scan to feed it here."""
+    ctx = golden.load_golden_run_context()
+    rows = ctx["attention"]
+    assert rows
+    tie_break = ks.attention_tie_break(ctx["stats_summary"], None, ctx["behaviour"])
+    assert rows == sorted(rows, key=tie_break.key)
+    hot = {h["path"] for h in ctx["stats_summary"]["top_hotspots"]}
+    for above, below in zip(rows, rows[1:]):
+        if above["score"] == below["score"]:
+            assert above["path"] in hot or below["path"] not in hot

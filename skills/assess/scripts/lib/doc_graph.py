@@ -32,6 +32,7 @@ import os
 import posixpath
 import re
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 try:  # networkx is the core dep; degrade rather than crash if it is missing.
@@ -132,7 +133,6 @@ _MDLINK_RE = re.compile(r"(?<!\!)\[(?:[^\]]*)\]\(([^)]+)\)")
 # stable as new schemes appear and avoids the specific-scheme gap that caused
 # `sms:` and `skype:` to be misclassified as broken file references (issue #227).
 _EXTERNAL_RE = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)
-_FENCE_RE = re.compile(r"```.*?\n.*?```", re.DOTALL)  # fenced code blocks
 # Inline-code spans: backtick-delimited segments on a single logical line. A
 # link target inside `[[foo]]` or `[text](./foo.md)` is documentation syntax
 # (an Obsidian skill teaching wikilinks, a FORMAT-spec showing a sample), not
@@ -151,11 +151,14 @@ def _strip_code_spans(text: str) -> str:
     """
     # Strip fenced blocks first so an inline-code regex can't snag content
     # inside a fence that legitimately contains backticks of its own.
-    return _INLINE_CODE_RE.sub("", _FENCE_RE.sub("", text))
+    return _INLINE_CODE_RE.sub("", _strip_fenced_lines(text))
 
 # Caps so a pathological repo can't bloat run-context.json.
 MAX_BROKEN_LINKS = 60
 MAX_MISSING_XREFS = 60
+# directory_breakdown keeps the rows with the largest gaps; directory_count
+# carries the full total so a truncated list still says how many there were.
+MAX_DIRECTORY_BREAKDOWN = 30
 # Conventional filenames that get mentioned all the time and don't need a
 # cross-reference every time they're named - excluded from the missing-xref scan.
 _XREF_SKIP_NAMES = {
@@ -197,6 +200,25 @@ class DocGraphResult:
     curated_doc_count: int = 0          # docs in the curated layer (== doc_count)
     raw_source_orphan_rate: float = 0.0  # orphan rate within the raw layer
     raw_source_broken_links: int = 0     # broken links originating in the raw layer
+    # Working-notes exclusion (issue #366): pattern-named notes hung off one or
+    # two index files (plans, session logs, tickets) leave the headline the
+    # same way, named with a file count, with the notes layer's own figures.
+    excluded_working_notes_trees: list[dict] = field(default_factory=list)  # [{path, file_count}]
+    working_notes_doc_count: int = 0
+    working_notes_orphan_rate: float = 0.0
+    working_notes_broken_links: int = 0
+    # Link-only figures (issue #353). The headline orphan_rate and
+    # reachability_pct count reference edges (a backticked doc path) as well as
+    # links; these two are the same figures over link edges alone.
+    link_only_orphan_rate: float = 0.0
+    link_only_reachability_pct: float = 0.0
+    # Per-top-level-directory counts (issue #365) over the same curated layer
+    # as the headline. While len(directory_breakdown) == directory_count the
+    # rows sum to doc_count, len(unreachable) and dangling_links; a list cut
+    # at MAX_DIRECTORY_BREAKDOWN sums to less.
+    # [{path, doc_count, unreachable_count, broken_link_count}]
+    directory_breakdown: list[dict] = field(default_factory=list)
+    directory_count: int = 0
     # Missing cross-references: a doc names another doc but never links to it
     # (Karpathy Lint). [{from, to}].
     missing_xrefs: list[dict] = field(default_factory=list)
@@ -239,6 +261,14 @@ class DocGraphResult:
             "curated_doc_count": self.curated_doc_count,
             "raw_source_orphan_rate": round(self.raw_source_orphan_rate, 3),
             "raw_source_broken_links": self.raw_source_broken_links,
+            "excluded_working_notes_trees": self.excluded_working_notes_trees,
+            "working_notes_doc_count": self.working_notes_doc_count,
+            "working_notes_orphan_rate": round(self.working_notes_orphan_rate, 3),
+            "working_notes_broken_links": self.working_notes_broken_links,
+            "link_only_orphan_rate": round(self.link_only_orphan_rate, 3),
+            "link_only_reachability_pct": round(self.link_only_reachability_pct, 3),
+            "directory_breakdown": self.directory_breakdown,
+            "directory_count": self.directory_count,
         }
 
 
@@ -488,6 +518,156 @@ def _target_exists(raw: str, source: Path, repo_root: Path) -> bool:
     return True
 
 
+def _cited_excluded_doc(
+    rel_path: str, repo_root: Path, tracked, scope: Path | None,
+    extra_dirs: set[str], extra_pats: list[str],
+) -> Path | None:
+    """The `.claude/` doc at `rel_path`, if a reference may bring it in.
+
+    `.claude` stays in `EXCLUDE_DIRS` for the walk, so an uncited agent file is
+    never a node; a cited one is navigation an agent follows and joins the
+    graph. Every other exclusion (built-in, user, untracked, out of scope)
+    still applies.
+    """
+    from lib.assess_config import is_user_excluded
+    parts = Path(rel_path).parts
+    if ".claude" not in parts or ".." in parts:
+        return None
+    if Path(rel_path).suffix.lower() not in DOC_EXTENSIONS:
+        return None
+    if is_excluded_path(Path(*[x for x in parts if x != ".claude"])):
+        return None
+    if is_user_excluded(Path(rel_path), extra_dirs, extra_pats):
+        return None
+    path = repo_root / rel_path
+    if not path.is_file() or not is_repo_file(path, repo_root, tracked):
+        return None
+    if scope is not None and not path.resolve().is_relative_to(scope.resolve()):
+        return None
+    return path.resolve()
+
+
+# Any indentation (a fence nested under a list item sits four or more spaces
+# in), behind any CommonMark container prefix: blockquote `>` markers and a
+# list-item marker (`- ~~~`, `1. ~~~`).
+_FENCE_OPEN_RE = re.compile(
+    r"^[ \t]*(?:>[ \t]*)*(?:(?:[-*+]|\d+[.)])[ \t]+)?(`{3,}|~{3,})"
+)
+
+
+def _strip_fenced_lines(text: str) -> str:
+    """Drop CommonMark fenced blocks line by line: backtick or tilde fences,
+    closed only by the same marker at least as long as the opener. An
+    unclosed fence runs to the end of the document."""
+    out: list[str] = []
+    fence = ""
+    for line in text.splitlines():
+        m = _FENCE_OPEN_RE.match(line)
+        if not fence:
+            if m and not (m.group(1)[0] == "`" and "`" in line[m.end():]):
+                fence = m.group(1)
+            else:
+                out.append(line)
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) \
+                and not line[m.end():].strip():
+            fence = ""
+    return "\n".join(out)
+
+
+def _reference_paths(text: str, source_rel: str) -> list[tuple[str, str]]:
+    """Doc paths named by backticked tokens outside fences, as
+    `(raw_ref, doc_relative_candidate)` pairs, in document order.
+
+    Reuses the ownership parser's path-token rules. A span that holds link
+    syntax (`[[x]]`, `[x](y)`) is a teaching sample, not a citation, so it is
+    skipped here just as the link pass strips it.
+    """
+    from lib.ownership_parser import _extract_path_refs
+    out: list[tuple[str, str]] = []
+    for m in _INLINE_CODE_RE.finditer(_strip_fenced_lines(text)):
+        span = m.group(0)
+        if "[[" in span or "](" in span:
+            continue
+        for ref in sorted(_extract_path_refs(span, tuple(DOC_EXTENSIONS))):
+            if Path(ref).suffix.lower() not in DOC_EXTENSIONS:
+                continue
+            local = ref.lstrip("/") if ref.startswith("/") else posixpath.normpath(
+                posixpath.join(posixpath.dirname(source_rel), ref))
+            out.append((ref, local))
+    return out
+
+
+def _read_doc(path: Path) -> str | None:
+    """A doc's text, or None when it cannot be read (Layer 0 is best-effort)."""
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+
+def _basename_index(rels) -> dict[str, list[str]]:
+    """Repo-relative doc paths grouped by basename, built once per graph."""
+    out: dict[str, list[str]] = {}
+    for r in rels:
+        out.setdefault(posixpath.basename(r), []).append(r)
+    return out
+
+
+def _resolve_references(
+    text: str, source_rel: str, repo_root: Path,
+    doc_by_rel: dict[str, Path], doc_rels: set[str], by_basename: dict[str, list[str]],
+    cite,
+) -> list[Path]:
+    """Docs named by backticked paths in `text`, exact paths before guesses:
+    the doc-relative path (walked doc or cited `.claude/` doc), then the
+    ownership parser's resolver over the walked docs (repo-root path or a
+    basename that names exactly one doc), then a cited `.claude/` doc at the
+    literal path. `cite` is `_cited_excluded_doc` bound to the run's excludes.
+
+    `doc_by_rel` / `doc_rels` hold the walked docs only and never grow, so a
+    doc's references depend on its own text and the walk, not on read order.
+    """
+    from lib.ownership_parser import _resolve_ref
+    found: list[Path] = []
+    for ref, local in _reference_paths(text, source_rel):
+        hit = doc_by_rel.get(local) or cite(local)
+        if hit is None:
+            # A bare basename reads the prebuilt index instead of the resolver's
+            # per-call sweep of every doc; a path (or a root-level exact name,
+            # which the resolver prefers over a basename match) goes through it.
+            hits = (set(by_basename.get(ref, [])) if "/" not in ref and ref not in doc_rels
+                    else {str(x) for x in _resolve_ref(ref, repo_root, doc_rels)})
+            hit = doc_by_rel[next(iter(hits))] if len(hits) == 1 else cite(ref.lstrip("/"))
+        if hit is not None:
+            found.append(hit)
+    return found
+
+
+def _settle_references(
+    docs: list[Path], texts: dict[Path, str], rel, resolve,
+) -> list[tuple[Path, Path]]:
+    """First pass: read every doc into `texts` and resolve its reference edges.
+
+    A cited `.claude/` doc is appended to `docs` and read in turn, so the link
+    pass that follows sees the final doc set (and name index) whatever order
+    the walk produced. Returns `(source, target)` pairs, self-citations dropped.
+    """
+    seen = set(docs)
+    pairs: list[tuple[Path, Path]] = []
+    for d in docs:  # grows while iterating: cited .claude docs join the queue
+        text = _read_doc(d)
+        if text is None:
+            continue
+        texts[d] = text
+        for tgt in resolve(text, rel(d)):
+            if tgt not in seen:
+                seen.add(tgt)
+                docs.append(tgt)
+            if tgt != d:
+                pairs.append((d, tgt))
+    return pairs
+
+
 def _missing_xrefs(docs, texts: dict, graph, repo_root: Path, rel) -> list[dict]:
     """Docs that name another doc's filename in prose but never link to it
     (Karpathy Lint: "missing cross-references").
@@ -509,7 +689,7 @@ def _missing_xrefs(docs, texts: dict, graph, repo_root: Path, rel) -> list[dict]
         text = texts.get(d)
         if not text:
             continue
-        body = _FENCE_RE.sub("", text)
+        body = _strip_fenced_lines(text)
         seen: set[Path] = set()
         for m in pattern.finditer(body):
             t = name_to_doc.get(m.group(1).lower())
@@ -561,11 +741,13 @@ def classify_node(node: str, entries: set, unreachable: set, orphans: set) -> st
     return "island"
 
 
-def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 19, ratchet target
+def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 21, ratchet target
     repo_root: Path, doc_files: list[Path] | None = None,
     extra_exclude_dirs: set[str] | None = None,
     extra_exclude_patterns: list[str] | None = None,
     scope: Path | None = None,
+    working_notes_dirs: list[str] | None = None,
+    working_notes_ignore: list[str] | None = None,
 ) -> DocGraphResult:
     """Parse docs, build the link graph, and derive navigability signals.
 
@@ -573,6 +755,9 @@ def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 19, 
     within a subtree for `/assess <path>` monorepo scoping; omit it for a
     whole-repo run. `.base` hub discovery honours the same scope so a scoped
     graph carries no navigation signal from a sibling directory.
+    `working_notes_dirs` / `working_notes_ignore` are the `.assess/config.toml`
+    overrides (`lib.assess_config.load_working_notes_config`) that force or
+    suppress working-notes classification for repo-relative directories.
     """
     repo_root = repo_root.resolve()
     vault = _vault_detected(repo_root)
@@ -602,11 +787,27 @@ def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 19, 
             vault_detected=vault, obsidiantools_available=obs,
         )
 
-    by_relpath, by_name, by_stem = _build_name_index(docs, repo_root)
-    doc_set = set(docs)
-
     def rel(p: Path) -> str:
         return str(p.relative_to(repo_root))
+
+    # Reference edges (issue #353) settle first: a backticked token naming an
+    # existing doc. A cited `.claude/` doc joins `docs` here, before the name
+    # index and the link pass, so links and wikilinks reach it from any doc.
+    texts: dict[Path, str] = {}
+    discovered = list(docs)  # the walked set; `docs` grows with cited .claude docs
+    doc_by_rel = {rel(x): x for x in discovered}
+    cite = partial(
+        _cited_excluded_doc, repo_root=repo_root, tracked=tracked_files(repo_root),
+        scope=scope, extra_dirs=extra_exclude_dirs or set(),
+        extra_pats=extra_exclude_patterns or [],
+    )
+    ref_pairs = _settle_references(docs, texts, rel, partial(
+        _resolve_references, repo_root=repo_root, doc_by_rel=doc_by_rel,
+        doc_rels=set(doc_by_rel), by_basename=_basename_index(doc_by_rel), cite=cite,
+    ))
+
+    by_relpath, by_name, by_stem = _build_name_index(docs, repo_root)
+    doc_set = set(docs)
 
     graph = nx.DiGraph()
     for d in docs:
@@ -616,7 +817,6 @@ def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 19, 
     ambiguous = 0
     broken: list[dict] = []
     _broken_seen: set[tuple[str, str]] = set()
-    texts: dict[Path, str] = {}
     # Per-doc count of non-navigational URI-scheme links (mailto:/tel:/external
     # http) - the machine-extraction fingerprint a converted document carries.
     # Feeds raw-source-tree detection (issue #225).
@@ -629,13 +829,9 @@ def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 19, 
             broken.append({"from": rel(src), "target": target, "kind": kind})
 
     for d in docs:
-        try:
-            text = d.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            # Best-effort scan: skip an unreadable doc rather than aborting the
-            # whole graph build (Layer 0 stays best-effort).
+        text = texts.get(d)
+        if text is None:  # unreadable: skipped, Layer 0 stays best-effort
             continue
-        texts[d] = text
         # Strip code spans before harvesting links: a link target inside a
         # fence or backtick span is a documentation sample (FORMAT specs,
         # wikilink-syntax demos), not a navigation edge.
@@ -660,7 +856,7 @@ def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 19, 
                 _add_broken(d, wikilink_target, "wikilink")
                 continue
             if tgt in doc_set and tgt != d:
-                graph.add_edge(rel(d), rel(tgt))
+                graph.add_edge(rel(d), rel(tgt), kind="link")
         # CommonMark links resolve relative to the doc's directory.
         for m in _MDLINK_RE.finditer(link_text):
             raw = m.group(1)
@@ -680,11 +876,16 @@ def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 19, 
                 continue
             if tgt.suffix.lower() in DOC_EXTENSIONS and tgt in doc_set:
                 if tgt != d:
-                    graph.add_edge(rel(d), rel(tgt))
+                    graph.add_edge(rel(d), rel(tgt), kind="link")
             elif tgt.suffix.lower() in CODE_EXTENSIONS:
                 doc_to_code.append({"doc": rel(d), "code": rel(tgt)})
+    # A link between the same pair keeps kind link.
+    graph.add_edges_from([
+        (rel(src), rel(tgt)) for src, tgt in ref_pairs
+        if not graph.has_edge(rel(src), rel(tgt))
+    ], kind="reference")
 
-    missing = _missing_xrefs(docs, texts, graph, repo_root, rel)
+    missing = _missing_xrefs(discovered, texts, graph, repo_root, rel)
 
     # Vault-native navigation: `.base` view hubs + ```dataview``` query blocks
     # surface notes dynamically, so a static-link-only graph scores a navigable
@@ -702,14 +903,20 @@ def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 19, 
     # read-side metrics so the curated-wiki signal isn't drowned. Detection runs
     # on the *final* graph (after vault edges), so a doc made navigable by a
     # `.base` hub or dataview query is not misread as raw.
-    excluded_docs, raw_trees = _detect_raw_trees(
+    raw_docs, raw_trees = _detect_raw_trees(
         graph, docs, repo_root, rel, base_hubs, machine_links,
     )
+    # Working-notes trees (issue #366) are the second fingerprint, detected on
+    # what the raw pass leaves so no doc belongs to both layers.
+    notes_docs, notes_trees = _detect_working_notes_trees(
+        graph, {rel(d) for d in docs} - raw_docs,
+        force=working_notes_dirs or [], ignore=working_notes_ignore or [],
+    )
+    excluded_docs = raw_docs | notes_docs
     curated_docs = [d for d in docs if rel(d) not in excluded_docs]
     curated_nodes = [n for n in graph.nodes() if n not in excluded_docs]
     curated_graph = graph.subgraph(curated_nodes).copy()
     curated_broken = [b for b in broken if b.get("from") not in excluded_docs]
-    raw_broken = [b for b in broken if b.get("from") in excluded_docs]
     curated_missing = [
         mx for mx in missing
         if mx.get("from") not in excluded_docs and mx.get("to") not in excluded_docs
@@ -720,21 +927,98 @@ def build_doc_graph(  # noqa: C901  # graph assembly + link resolution; ccn 19, 
         doc_to_code=doc_to_code, dangling=len(curated_broken), ambiguous=ambiguous,
         vault=vault, obs=obs, base_hubs=base_hubs,
     )
+    link_graph = nx.DiGraph()
+    link_graph.add_nodes_from(curated_graph)
+    link_graph.add_edges_from(
+        (u, v) for u, v, k in curated_graph.edges(data="kind") if k != "reference"
+    )
+    link_only = _derive_signals(
+        graph=link_graph, docs=curated_docs, repo_root=repo_root, rel=rel,
+        doc_to_code=doc_to_code, dangling=0, ambiguous=0,
+        vault=vault, obs=obs, base_hubs=base_hubs, entries=result.entry_points,
+    )
+    result.link_only_orphan_rate = link_only.orphan_rate
+    result.link_only_reachability_pct = link_only.reachability_pct
     result.broken_links = curated_broken[:MAX_BROKEN_LINKS]
     result.missing_xrefs = curated_missing[:MAX_MISSING_XREFS]
+    rows = _directory_breakdown(curated_nodes, result.unreachable, curated_broken)
+    result.directory_breakdown = rows[:MAX_DIRECTORY_BREAKDOWN]
+    result.directory_count = len(rows)
 
-    # Raw-layer figures, reported separately so the exclusion stays legible.
-    in_deg_full = dict(graph.in_degree())
-    raw_doc_count = len(excluded_docs)
-    raw_orphans = sum(1 for r in excluded_docs if in_deg_full.get(r, 0) == 0)
-    result.excluded_raw_trees = [
-        {"path": t["path"], "file_count": t["file_count"]} for t in raw_trees
-    ]
-    result.raw_source_doc_count = raw_doc_count
+    # Excluded-layer figures, reported separately so the exclusion stays legible.
     result.curated_doc_count = result.doc_count
-    result.raw_source_orphan_rate = (raw_orphans / raw_doc_count) if raw_doc_count else 0.0
-    result.raw_source_broken_links = len(raw_broken)
+    (result.excluded_raw_trees, result.raw_source_doc_count,
+     result.raw_source_orphan_rate, result.raw_source_broken_links,
+     ) = _layer_figures(graph, broken, raw_docs, raw_trees)
+    (result.excluded_working_notes_trees, result.working_notes_doc_count,
+     result.working_notes_orphan_rate, result.working_notes_broken_links,
+     ) = _layer_figures(graph, broken, notes_docs, notes_trees)
     return result
+
+
+def _top_dir(rel_path: str) -> str:
+    """First path segment of a doc's rel path; root-level docs key as ``.``."""
+    head, sep, _ = rel_path.partition("/")
+    return head if sep else "."
+
+
+def _directory_breakdown(
+    nodes, unreachable: list[str], broken: list[dict],
+) -> list[dict]:
+    """Doc, unreachable and broken-link counts per top-level directory, largest
+    gap first. A broken link counts toward the directory of the doc it is
+    written in (``from``)."""
+    counts: dict[str, list[int]] = {}
+    for n in nodes:
+        counts.setdefault(_top_dir(n), [0, 0, 0])[0] += 1
+    for n in unreachable:
+        counts[_top_dir(n)][1] += 1
+    for b in broken:
+        counts.setdefault(_top_dir(b.get("from", "")), [0, 0, 0])[2] += 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1][1], -kv[1][2], -kv[1][0], kv[0]))
+    return [
+        {"path": d, "doc_count": c[0], "unreachable_count": c[1], "broken_link_count": c[2]}
+        for d, c in ranked
+    ]
+
+
+def _layer_figures(
+    graph, broken: list[dict], layer_docs: set[str], trees: list[dict],
+) -> tuple[list[dict], int, float, int]:
+    """An excluded layer's own figures: its trees as ``{path, file_count}``,
+    doc count, orphan rate over the full graph, and broken links it holds."""
+    in_deg = dict(graph.in_degree())
+    n = len(layer_docs)
+    orphans = sum(1 for r in layer_docs if in_deg.get(r, 0) == 0)
+    return (
+        [{"path": t["path"], "file_count": t["file_count"]} for t in trees],
+        n,
+        (orphans / n) if n else 0.0,
+        sum(1 for b in broken if b.get("from") in layer_docs),
+    )
+
+
+def _detect_working_notes_trees(
+    graph, doc_rels: set[str], *, force: list[str], ignore: list[str],
+) -> tuple[set[str], list[dict]]:
+    """Detect working-notes subtrees and return (excluded_doc_rels, trees).
+
+    ``doc_rels`` is the doc set minus raw-source docs; like the raw pass it
+    never classifies a non-doc node (a ``.base`` hub). Signals come from the
+    headline graph (link and reference edges) restricted to those docs: each doc's in-degree and the docs its inbound
+    edges come from, so the classifier can tell one index holding the links
+    from a wiki whose links are spread out. The verdict is
+    ``lib.raw_source.classify_working_notes_trees``; ``force`` / ``ignore``
+    are the config overrides, passed through.
+    """
+    from lib.raw_source import classify_working_notes_trees
+
+    signals: dict[str, dict] = {}
+    for r in sorted(doc_rels):
+        sources = [u for u in graph.predecessors(r) if u in doc_rels]
+        signals[r] = {"in_degree": len(sources), "inbound_sources": sources}
+    trees = classify_working_notes_trees(signals, force=force, ignore=ignore)
+    return {r for t in trees for r in t["docs"]}, trees
 
 
 def _detect_raw_trees(
@@ -808,7 +1092,7 @@ def _apply_vault_edges(
         for query in parse_dataview_queries(text):
             for tgt in select_notes(query, doc_rels, frontmatter_of):
                 if tgt != d:
-                    graph.add_edge(rel(d), rel(tgt))
+                    graph.add_edge(rel(d), rel(tgt), kind="link")
 
     # `.base` hubs: a new hub node with edges to every note its query selects.
     base_hubs: list[str] = []
@@ -829,7 +1113,7 @@ def _apply_vault_edges(
             graph.add_node(hub)
         base_hubs.append(hub)
         for tgt in targets:
-            graph.add_edge(hub, rel(tgt))
+            graph.add_edge(hub, rel(tgt), kind="link")
     return base_hubs
 
 
@@ -909,6 +1193,7 @@ def _derive_signals(
     *, graph, docs: list[Path], repo_root: Path, rel,
     doc_to_code: list[dict], dangling: int, ambiguous: int,
     vault: bool, obs: bool, base_hubs: list[str] | None = None,
+    entries: list[str] | None = None,
 ) -> DocGraphResult:
     nodes = list(graph.nodes())
     n = len(nodes)
@@ -920,7 +1205,10 @@ def _derive_signals(
 
     # `.base` hubs are dynamic navigation surfaces, so they seed reachability
     # alongside the README/AGENTS/MOC entry points (issue #176).
-    entry_set = set(_pick_entry_points(docs, repo_root, pagerank, rel, base_hubs))
+    # `entries` pins the roots (the link-only pass reuses the headline's, so the
+    # two figures differ only in their edge set).
+    entry_set = set(entries if entries is not None
+                    else _pick_entry_points(docs, repo_root, pagerank, rel, base_hubs))
 
     orphans = sorted(
         x for x in nodes if in_deg.get(x, 0) == 0 and x not in entry_set
