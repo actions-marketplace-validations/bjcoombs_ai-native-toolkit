@@ -62,6 +62,19 @@ workflow (``.github/workflows/floor.yml``) and pytest both drive:
     basename allowlist, so the protected set survives a layout move that a
     hand-maintained path regex would silently drop.
 
+``signoff-summary``
+    The explanation shown to the maintainer when the floor-core sign-off is
+    requested: why (clause iii), which floor-core paths changed and by how many
+    lines, the head commit the approval covers, and what approving and
+    rejecting mean. The paths come from the ``floor-core`` role the trigger
+    asks for; CI renders with the base ref's copy, so the two agree unless the
+    pull request edits the classification itself, and then the section still
+    appears (this script is floor core in the base copy that renders it)
+    and at worst counts a newly floor-core path among the other changed
+    paths, which it breaks down by role. When the floor core changes only by like-for-like ``uses:`` pin
+    bumps the section says so and lists each action's old and new commit.
+    Prints nothing when the floor core is untouched.
+
 ``clauses``
     Unconditional integrity check of ``FLOOR.md``: the file must exist, it must
     declare its ``floor-tokens`` block with at least the four tokens the floor
@@ -76,6 +89,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import string
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -148,6 +162,33 @@ FLOOR_CORE_PATHS = (
     "scripts/floor_anchor.py",
     ".github/workflows/floor.yml",
 )
+
+
+# The sign-off explanation's section title. (The workflow finds its own
+# pull-request comment by a hidden marker it adds, not by this title.) The
+# clause purpose is read from FLOOR.md at the base ref and falls back to this
+# sentence when the file there does not carry the clause.
+SIGNOFF_HEADING = "Floor sign-off requested"
+CLAUSE_III_PURPOSE = "Changes to the floor require the maintainer's out-of-band sign-off."
+CLAUSE_III_HEADING_RE = re.compile(
+    r"<!-- floor-clause:iii -->\s*\*\*iii\.\s+(.+?)\*\*", re.DOTALL
+)
+
+# One changed workflow line that is only an action pin:
+# ``- uses: owner/action@<sha>  # <version>`` (the list dash is optional).
+# The action and the version comment are pull-request text that the summary
+# renders, so both are held to a charset that carries no markdown or HTML
+# meaning. A `uses:` line outside it is not a pin: the pin-only verdict is
+# withheld and the line counts stand.
+USES_PIN_RE = re.compile(
+    r"^\s*(?:-\s+)?uses:\s*([\w.\-/]+)@([0-9a-fA-F]{7,40})"
+    r"\s*(?:#\s*([\w.+\-/ ]*?))?\s*$",
+    re.ASCII,
+)
+
+# Text the summary may put in a code span as it stands: no backtick, no
+# angle bracket, no emphasis or link syntax, no leading or trailing space.
+MD_CODE_SAFE_RE = re.compile(r"[\w.+\-/@]+(?: [\w.+\-/@]+)*", re.ASCII)
 
 
 class FloorTokenError(ValueError):
@@ -320,6 +361,166 @@ def missing_clauses(floor_text: str | None) -> list[str]:
         if any(token not in floor_text for token in required):
             missing.append(clause_id)
     return missing
+
+
+def clause_iii_purpose(floor_text: str | None) -> str:
+    """Clause iii's bold one-sentence purpose, as ``FLOOR.md`` states it."""
+    match = CLAUSE_III_HEADING_RE.search(floor_text or "")
+    if match is None:
+        return CLAUSE_III_PURPOSE
+    return " ".join(match.group(1).split())
+
+
+def md_literal(text: str) -> str:
+    """``text`` as inert markdown: a code span when it holds only safe
+    characters, otherwise plain text with every ASCII punctuation character
+    backslash-escaped and every unprintable character spelled as its code
+    point, so pull-request text can close no code span, open no HTML comment
+    and form no emphasis or link in the approver's view."""
+    if MD_CODE_SAFE_RE.fullmatch(text):
+        return f"`{text}`"
+    out = []
+    for ch in text:
+        if ch in string.punctuation:
+            out.append("\\" + ch)
+        elif ch.isprintable():
+            out.append(ch)
+        else:
+            out.append("\\\\" + f"u{ord(ch):04x}")
+    return "".join(out)
+
+
+_Pin = tuple[str, str, str]
+
+
+def _pin_lines(diff_text: str) -> list[tuple[list[_Pin], list[_Pin]]] | None:
+    """The removed and added ``(action, commit, version)`` pins of a ``-U0``
+    diff, one ``(removed, added)`` pair per hunk in diff order, or ``None``
+    when a changed line is not a pin. A hunk belongs to one file, so keeping
+    the hunks apart keeps the files apart too."""
+    hunks: list[tuple[list[_Pin], list[_Pin]]] = []
+    in_hunk = False
+    for line in diff_text.splitlines():
+        # Track hunk state rather than prefix-match headers: inside a hunk a
+        # leading `+`/`-` is always content, even a removed `---` rule.
+        if line.startswith("diff --git"):
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            hunks.append(([], []))
+            continue
+        if not in_hunk or not line.startswith(("+", "-")):
+            continue
+        match = USES_PIN_RE.match(line[1:])
+        if match is None:
+            return None
+        action, commit, version = match.groups()
+        removed, added = hunks[-1]
+        side = added if line.startswith("+") else removed
+        side.append((action, commit.lower(), version or ""))
+    return hunks
+
+
+def pin_changes(diff_text: str) -> list[tuple[str, str, str]] | None:
+    """The ``uses:`` pin changes in a ``-U0`` diff, or ``None`` when the diff
+    is anything other than a like-for-like bump (or changes nothing).
+
+    Each entry is ``(action, old, new)`` where ``old`` and ``new`` read
+    ``<commit> <version comment>``. Like-for-like means: every changed line is
+    a pin; within each hunk the removed and added pins name the same actions
+    in the same order (an action added, dropped, swapped for another or moved
+    changes what the workflow runs, and a pin removed in one hunk and added in
+    another, whether another job or another file, has moved, not been bumped
+    in place); and every pair either changes its commit or is the same pin
+    re-indented. A version comment relabelled on an unchanged commit is not a
+    bump, and a diff that changes no commit is not one either.
+    """
+    hunks = _pin_lines(diff_text)
+    if hunks is None:
+        return None
+    pairs: list[tuple[_Pin, _Pin]] = []
+    for removed, added in hunks:
+        if [pin[0] for pin in removed] != [pin[0] for pin in added]:
+            return None  # also a removal-only or addition-only hunk
+        pairs += zip(removed, added)
+    changes: list[tuple[str, str, str]] = []
+    for (action, old_commit, old_version), (_, new_commit, new_version) in pairs:
+        if old_commit == new_commit:
+            if old_version != new_version:
+                return None  # a relabelled comment, not a bump
+            continue  # the same pin re-indented
+        change = (
+            action,
+            f"{old_commit} {old_version}".strip(),
+            f"{new_commit} {new_version}".strip(),
+        )
+        if change not in changes:
+            changes.append(change)
+    return changes or None
+
+
+def render_signoff_summary(
+    paths: list[tuple[str, str]],
+    head_commit: str,
+    clause_purpose: str,
+    pins: list[tuple[str, str, str]] | None,
+    other_roles: dict[str, int] | None = None,
+) -> str:
+    """The markdown section the maintainer reads before approving.
+
+    ``paths`` is ``(path, detail)`` per changed floor-core path, where the
+    detail is ``+<added> -<removed>`` or ``binary change`` with the kind of
+    change (added, deleted, type change, mode change) named alongside.
+    ``other_roles`` counts the other changed paths by protected role
+    (``unprotected`` for the rest). They are counted, never listed, so the
+    verdict below is never read as covering them. Every path, commit, action
+    and version is pull-request text and goes through ``md_literal``.
+    """
+    others = {role: n for role, n in (other_roles or {}).items() if n}
+    breakdown = ", ".join(f"{n} {role}" for role, n in others.items())
+    lines = [
+        f"## {SIGNOFF_HEADING}",
+        "",
+        "This pull request changes the floor's own enforcement, so it waits on "
+        "the maintainer's deployment review of the `floor-signoff` environment.",
+        "",
+        f"**Why:** FLOOR.md clause iii. {clause_purpose}",
+        "",
+        f"**Head commit the approval covers:** {md_literal(head_commit)}",
+        "",
+        "**Floor-core paths changed:**",
+        "",
+    ]
+    lines += [f"- {md_literal(path)} {detail}" for path, detail in paths]
+    lines += [
+        "",
+        f"Other paths changed in this pull request (not floor core, not listed "
+        f"here): {sum(others.values())}" + (f" ({breakdown})" if breakdown else ""),
+    ]
+    if pins:
+        lines += [
+            "",
+            "**pin-only change:** every changed floor-core line is a `uses:` "
+            "action pin bumped in place, and no other floor-core line changed. "
+            "Each action shows its old commit and version -> its new commit and "
+            "version:",
+            "",
+        ]
+        lines += [
+            f"- {md_literal(action)}: {md_literal(old)} -> {md_literal(new)}"
+            for action, old, new in pins
+        ]
+    lines += [
+        "",
+        "**Approving** asserts that these changes to the floor's own "
+        "enforcement are intended.",
+        "",
+        "**Rejecting** turns the required `floor enforcement` check red, so "
+        "the pull request cannot merge.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 # ── Git plumbing ─────────────────────────────────────────────────────────────
@@ -597,6 +798,113 @@ def cmd_protected(args: argparse.Namespace) -> int:
     return 0
 
 
+def _git_out(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=True
+    ).stdout
+
+
+# How the other changed paths are named in the sign-off count.
+_ROLE_LABELS = {
+    ROLE_CANARY: "canary",
+    ROLE_GATE_CODE: "gate code",
+    ROLE_MARKED_COMPONENT: "marked component",
+    None: "unprotected",
+}
+
+
+# How a `git diff --raw` status letter is named in the path list. A plain
+# modification (M) carries no label beyond its counts.
+_STATUS_LABELS = {"A": "added", "D": "deleted", "T": "type change"}
+
+
+def _raw_change(base: str, path: str) -> tuple[str, bool]:
+    """``path``'s status letter and whether its file mode changed.
+    ``--numstat`` counts lines only, so both are read from ``--raw``
+    (``:<old mode> <new mode> <old sha> <new sha> <status>``). A mode change
+    is a modification whose two modes differ; an added or deleted file has an
+    all-zero mode on one side, and a type change is named as one."""
+    raw = _git_out("diff", "--raw", "--no-renames", base, "HEAD", "--", path)
+    for line in raw.splitlines():
+        fields = line.lstrip(":").split()
+        if len(fields) >= 5:
+            status = fields[4][:1]
+            return status, status == "M" and fields[0] != fields[1]
+    return "M", False
+
+
+def _path_detail(base: str, path: str) -> tuple[str, bool]:
+    """``+<added> -<removed>`` for a text change, ``binary change`` for a
+    binary one, with ``added``, ``deleted``, ``type change`` or ``mode
+    change`` named alongside, each only when git reports it. The flag is True
+    only for a text modification with no other change: anything else vetoes
+    the pin-only verdict, since a pin diff cannot show it."""
+    numstat = _git_out("diff", "--numstat", "--no-renames", base, "HEAD", "--", path)
+    added, removed = "0", "0"
+    for line in numstat.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3:
+            added, removed = parts[0], parts[1]
+    status, mode = _raw_change(base, path)
+    parts = []
+    if added == "-":
+        parts.append("binary change")
+    elif added != "0" or removed != "0":
+        parts.append(f"+{added} -{removed}")
+    if status in _STATUS_LABELS:
+        parts.append(_STATUS_LABELS[status])
+    if mode:
+        parts.append("mode change")
+    if status == "A" and not (added != "0" or removed != "0"):
+        parts.append("empty")
+    pure_text = status == "M" and not mode and bool(parts) and added != "-"
+    return ", ".join(parts), pure_text
+
+
+def cmd_signoff_summary(args: argparse.Namespace) -> int:
+    """Print the sign-off explanation, or nothing when the floor core is untouched.
+
+    The changed paths are ``git diff --name-only <base> HEAD`` classified with
+    the roles of this copy of the script; CI runs the base ref's copy, so a
+    pull request that edits the classification is described by the rules it
+    is changing, and at worst counts a newly floor-core path among the others.
+    ``--head-commit`` only changes the commit the text cites: in CI ``HEAD`` is
+    the merge commit, and the approval covers the pull request's head.
+    """
+    base = args.base
+    component_dirs = _protected_component_dirs(base)
+    changed = [
+        path
+        for path in dict.fromkeys(_git_out("diff", "--name-only", base, "HEAD").splitlines())
+        if path
+    ]
+    roles = {path: classify_path(path, component_dirs) for path in changed}
+    floor_core = [path for path in changed if roles[path] == ROLE_FLOOR_CORE]
+    if not floor_core:
+        return 0
+    details = [(path, *_path_detail(base, path)) for path in floor_core]
+    pins = None
+    if all(has_hunk for _, _, has_hunk in details):
+        pins = pin_changes(
+            _git_out("diff", "-U0", "--no-renames", base, "HEAD", "--", *floor_core)
+        )
+    head = args.head_commit or _git_out("rev-parse", "HEAD").strip()
+    # Quote the clause as the base declares it, so a pull request that
+    # rewrites clause iii does not supply its own justification.
+    purpose = clause_iii_purpose(_git_show(base, FLOOR_FILE))
+    other_roles: dict[str, int] = {}
+    for path in changed:
+        if roles[path] != ROLE_FLOOR_CORE:
+            label = _ROLE_LABELS[roles[path]]
+            other_roles[label] = other_roles.get(label, 0) + 1
+    sys.stdout.write(
+        render_signoff_summary(
+            [(path, detail) for path, detail, _ in details], head, purpose, pins, other_roles
+        )
+    )
+    return 0
+
+
 def cmd_clauses(args: argparse.Namespace) -> int:
     floor_text = _read_head(args.floor)
     if floor_text is None:
@@ -657,6 +965,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="print only the paths in this role (default: every protected path)",
     )
     p_protected.set_defaults(func=cmd_protected)
+
+    p_signoff = sub.add_parser(
+        "signoff-summary",
+        help="explain a floor-core sign-off request (prints nothing when none is due)",
+    )
+    p_signoff.add_argument(
+        "--base", required=True, help="git ref for the merge-base (e.g. origin/main)"
+    )
+    p_signoff.add_argument(
+        "--head-commit",
+        help="commit the approval covers (default: git rev-parse HEAD); CI passes "
+        "the pull request's head because HEAD there is the merge commit",
+    )
+    p_signoff.set_defaults(func=cmd_signoff_summary)
 
     p_clauses = sub.add_parser("clauses", help="FLOOR.md four-clause integrity")
     p_clauses.add_argument("--floor", default=FLOOR_FILE, help="path to FLOOR.md")
