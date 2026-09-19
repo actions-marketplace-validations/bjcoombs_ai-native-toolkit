@@ -62,6 +62,7 @@ from lib.instruction_claims import scan_instruction_claims
 from lib.interactivity import build_offers_block
 from lib.doc_graph import build_doc_graph, is_repo_file
 from lib.doc_staleness import analyze_doc_staleness
+from lib.generated_files import matches_generated_name
 from lib.git_churn import git_commit_info, tracked_files
 from lib.keyhole_signals import integrate as integrate_keyhole_signals
 from lib.liveness_scan import scan_liveness
@@ -612,6 +613,25 @@ def _write_badge(
 MAX_ACCRETION_FILES = 12
 
 
+def _excluded_generated(complexity_stats: dict) -> list[dict[str, str]]:
+    """The stats file's ``excluded_generated`` list, keeping well-formed rows.
+
+    Each row is ``{"path", "reason"}`` with non-empty strings; anything else
+    (an older stats file without the key, a malformed row) is dropped, so the
+    run-context key is always a list.
+    """
+    rows = complexity_stats.get("excluded_generated")
+    if not isinstance(rows, list):
+        return []
+    return [
+        {"path": r["path"], "reason": r["reason"]}
+        for r in rows
+        if isinstance(r, dict)
+        and isinstance(r.get("path"), str) and r["path"]
+        and isinstance(r.get("reason"), str) and r["reason"]
+    ]
+
+
 def _top_band_paths(complexity_stats: dict) -> set[str]:
     """Paths already in the top complexity/size band of this run's stats.
 
@@ -974,6 +994,16 @@ def build_run_context(
     )
 
     diff = diff_stats(prior=prior, current=current)
+    # A hotspot that left the ranking because this run excluded it as generated
+    # did not graduate: the filter changed, not the file. Drop it from the
+    # graduated list so the append-only log and index never record it as one.
+    # Content excludes are named in excluded_generated; the generated-name
+    # globs are silent, so they are matched here directly.
+    generated_paths = {r["path"] for r in _excluded_generated(current)}
+    diff.graduated = [
+        h for h in diff.graduated
+        if h.path not in generated_paths and not matches_generated_name(h.path)
+    ]
     instruction_files, instructions_grade, untracked_instr, dangling_instr, skills_info, \
         sensitive_instr = _grade_instruction_files(repo_root)
 
@@ -1501,6 +1531,11 @@ def build_run_context(
         "count": len(pruned_finding_paths),
         "rename_map_complete": keyhole.get("rename_map_complete", True),
     }
+    # Generated-file disclosure: the treemap drops files that declare
+    # themselves generated (header marker) or carry payload-length lines, and
+    # lists them in the stats file. Copied through so the report and gate name
+    # each one with its reason rather than letting it vanish from the ranking.
+    ctx["excluded_generated"] = _excluded_generated(current)
 
     # Structure drift (third write-side tendency surface: a declared ownership
     # map that no longer matches where the code lives). Tier 0 is the cheap
