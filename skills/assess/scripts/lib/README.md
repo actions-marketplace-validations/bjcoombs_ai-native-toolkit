@@ -617,6 +617,17 @@ directory, or a `--json` file that cannot be written; a missing root would other
 orchestrator. Add a case in `tests/test_evidence_check.py` alongside any new kind
 or change to a check rule.
 
+`assess_finalize.py` re-runs `check_evidence` on the finalize input's optional
+`evidence` list before any write (issue #362), with each `path` resolved against
+the parent of `.assess/`. The rule is per layer: a layer whose entries are all
+rejected refuses finalize (`FinalizeValidationError`, naming each entry by kind,
+path and needle); a layer with at least one verified entry keeps its verdict,
+and each rejected entry of it is printed to stderr as a warning. An input with no
+`evidence` key is not checked; a non-list value, or an entry naming no layer 0-8,
+is refused. An entry that names its layer but is otherwise malformed (unknown
+kind, missing path or needle) is rejected by `check_evidence` and counts under
+the per-layer rule like any other rejected entry.
+
 **`instruction_claims.py`**
 Verifies the checkable claims an agent instruction file makes (issue #368), no
 model. `scan_instruction_claims(repo_root, files)` reads each graded instruction
