@@ -2,8 +2,10 @@
 
 Deterministic library modules for the `/assess` engine. No LLM calls anywhere in this
 package - every function is a pure transform of filesystem, git, or pre-computed signal
-data. The LLM reads `run-context.json` after the core finishes; it does not call into
-these modules.
+data, with one bounded exception: live GitHub reads, confined to `gh_cli.py`, which are
+optional (they need a github.com remote and an authenticated `gh`) and degrade to
+`available: False` with a reason, never to a clean result. The LLM reads
+`run-context.json` after the core finishes; it does not call into these modules.
 
 ## The assess_core.py -> lib seam
 
@@ -467,6 +469,53 @@ rule (an uncommitted settings file reaches no clone). Deliberately excludes
 `.claude/agents/` and `.claude/skills/` - those are Layer 0's evidence - so the
 two layers never double-count. Pure stdlib JSON/filesystem reads plus
 `git_churn.tracked_files`.
+
+**`gh_cli.py`**
+The one way the core reaches GitHub, shared by every scan that reads live
+platform state. Runs the `gh` binary on `PATH` as a subprocess (no direct HTTP,
+no token read, JSON parsed in Python, never `--jq`/`--template`). Order of work:
+`resolve_github_remote` (pure git; `origin`, else the sole remote; github.com
+only), then the `gh auth status` probe (`open_github`), then `gh_api(path)` /
+`gh_json(args)` calls. Every failure raises `GhUnavailable` with a reason that
+`unavailable()` turns into `{"available": False, "reason"}`: `no_remote`,
+`gh_not_installed`, `not_authenticated`, `no_access` (HTTP 403), `not_found`
+(HTTP 404), `gh_timeout`, `gh_error`, `gh_bad_json`. A scan must degrade on it,
+never report a clean result. Tests fake `gh` with a script first on `PATH`
+(`tests/test_config_drift.py`).
+
+**`config_drift.py`**
+Layer 5 lying signal: tracked GitHub configuration snapshots diffed against the
+live setting via `gh_cli`. Snapshots are ruleset exports - tracked JSON with a
+`name` or `id` and a top-level `rules` array of `type` entries, in
+`.github/rulesets/` or anywhere (matched to a live ruleset by `id`, else `name`);
+a file missing either is skipped, never reported - and classic branch-protection exports - tracked JSON under
+`.github/` with `required_status_checks`, `enforce_admins` or
+`required_pull_request_reviews` at the top level (branch from the export's `url`,
+else the file stem). The diff is snapshot-driven (keys only the API returns are
+not drift), ignores ids, timestamps and links, and folds the `{"enabled": X}` read
+shape into `X`. Lists are sets. Write-shape restriction lists (plain user, team
+and app names) compare against the read shape's objects projected onto
+`login`/`slug`/`name`. A changed scalar list is one entry: `tracked` is
+`{count, removed, sample}`, `live` is `{count, added, sample}`, with at most
+`MAX_SAMPLE` (3) names per sample, never the whole live list. Object lists pair by
+identity (`login`, `slug`, `type`, `context`, `actor_type:actor_id`, `name`; users and
+teams carry `type` as a shared discriminator, so `login`/`slug` are tried first) in both directions, and a
+one-sided item, or a snapshot key the live response omits, is recorded as
+`"present"`/`"absent"`, never as the live object, so live org configuration stays
+out of the committed wiki (the item's identity does travel in `key`). Live rulesets
+are listed with `includes_parents=false`, so a repo snapshot never pairs with an
+inherited org ruleset. Tracked JSON holding none of the snapshot keys is skipped by
+a substring probe before any parse. A missing live ruleset, an
+unprotected branch and a deleted branch are drift entries, not outages. Emits
+`config_drift: {available, entries: [{file, key, tracked, live}], dropped, snapshots}`, entries
+ranked worst first (one-sided `"absent"`, then boolean flips, then other changes) because
+the report renders only `entries[0]`, then capped at `MAX_ENTRIES` (10) with `dropped`
+counting the rest. Stored in the committed wiki: changed scalar settings, list-item
+identities in `key`, and up to three added names per changed list; never a live
+object or a whole live list;
+with no snapshots it calls nothing and reports `entries: []`. Any refused or
+failed read degrades the whole block, never a partial clean result. Add a case
+in `tests/test_config_drift.py` alongside any change to discovery or the diff.
 
 **`accretion_ratchet.py`**
 Write-side accretion instrument: detects files that only ever grow. Walks each
