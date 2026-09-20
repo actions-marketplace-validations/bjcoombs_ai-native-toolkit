@@ -253,15 +253,80 @@ ACTION_STATUS_VALUES = frozenset({"pending", "claimed", "done", "reopened"})
 _ACTION_CARRY_FIELDS = ("status", "claimed_by", "completed_sha")
 
 
-def _read_prior_action_status(assess_dir: Path) -> dict[str, dict]:
-    """Prior actions keyed by their ``action`` text, for status carry-forward.
+def _action_paths(entry: dict) -> frozenset[str]:
+    """The files an action names, as a set.
 
-    The action directive is the stable identity across runs: rank reshuffles as
-    findings re-prioritise, but "investigate the src/foo.go seam" is the same
-    piece of work whether it ranks 1 or 3 this time. Reads v1 and v2 contracts
-    alike - a v1 entry simply carries no lifecycle fields, so a re-run over a v1
-    actions.json initialises every action to pending (backward compatible). A
-    missing or unreadable prior contract yields no carry-forward, not an error.
+    The ``files`` list is the source; a singular ``path`` is accepted as a
+    fallback. A set, so order and a repeated entry make no difference. Empty
+    when the entry names no file - which is what an action with no deterministic
+    fields at all looks like, and what the refusal in ``_match_prior_action``
+    reads to tell "different work" from "nothing to compare".
+    """
+    files = entry.get("files")
+    paths = (
+        {f for f in files if isinstance(f, str) and f}
+        if isinstance(files, list)
+        else set()
+    )
+    if not paths:
+        single = entry.get("path")
+        if isinstance(single, str) and single:
+            paths = {single}
+    return frozenset(paths)
+
+
+def _action_identity_key(entry: dict) -> str | None:
+    """The deterministic identity of an action: its finding plus its paths.
+
+    Rank reshuffles between runs and the directive text is written afresh by the
+    model each run, but "the hidden_coupling between src/foo.go and src/bar.go"
+    is the same piece of work under either. The paths come from the entry's
+    ``files`` list, falling back to a singular ``path``; they are sorted, so a
+    reordered list is still the same identity. ``None`` when the entry carries
+    no finding or no path - a judgement-filled slot has no deterministic fields,
+    and its text remains the only identity available.
+    """
+    finding = entry.get("finding")
+    if not isinstance(finding, str) or not finding:
+        return None
+    paths = _action_paths(entry)
+    if not paths:
+        return None
+    return "\x00".join(["finding", finding, *sorted(paths)])
+
+
+def _action_text_key(entry: dict) -> str | None:
+    """The fallback identity: the action directive text, as written.
+
+    ``None`` for an empty directive: ``ACTION_REQUIRED_KEYS`` checks that the
+    key is present, not that it says anything, and every empty string would
+    otherwise index into one bucket.
+    """
+    text = entry.get("action")
+    return "\x00".join(["action", text]) if isinstance(text, str) and text else None
+
+
+def _read_prior_action_status(assess_dir: Path) -> dict[str, list[dict]]:
+    """Prior actions indexed for status carry-forward, by identity and by text.
+
+    Each prior entry is registered under every key it can be found by: its
+    identity (finding plus paths) when it has one, and always its ``action``
+    text. Registering both is what lets a contract written before identity keys
+    existed - it carries no finding at all - still match on text on the first
+    run after the upgrade, while a contract that does carry those fields matches
+    on them even when the text was reworded. The two key spaces are prefixed, so
+    a text can never collide with an identity.
+
+    A key maps to a **list**, in the order the entries appear (the contract is
+    written sorted by rank). Text keys genuinely collide: the core renders one
+    canned directive per finding type, so two prior actions on different files
+    routinely carry byte-identical text, and keeping only one of them would hide
+    the other from carry-forward and leave which one survives to file order.
+
+    Reads v1 and v2 contracts alike - a v1 entry simply carries no lifecycle
+    fields, so a re-run over a v1 actions.json initialises every action to
+    pending (backward compatible). A missing or unreadable prior contract yields
+    no carry-forward, not an error.
     """
     path = assess_dir / "actions.json"
     if not path.exists():
@@ -270,11 +335,66 @@ def _read_prior_action_status(assess_dir: Path) -> dict[str, dict]:
         prior = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
-    out: dict[str, dict] = {}
+    out: dict[str, list[dict]] = {}
     for a in prior.get("actions", []) if isinstance(prior, dict) else []:
-        if isinstance(a, dict) and isinstance(a.get("action"), str):
-            out[a["action"]] = a
+        if not isinstance(a, dict):
+            continue
+        for key in (_action_identity_key(a), _action_text_key(a)):
+            if key is not None:
+                out.setdefault(key, []).append(a)
     return out
+
+
+def _match_prior_action(prior: dict[str, list[dict]], action: dict) -> dict:
+    """The prior entry for this action: identity first, then the text fallback.
+
+    Identity wins because it survives a rewording. Text is tried second because
+    a pre-change prior has no identity to match, and because an action with no
+    finding has none either.
+
+    A text hit is refused when the two entries share no file. The directive is
+    not free text per file: the core renders one canned phrase per finding type
+    (``FINDING_ACTIONS`` in ``lib/keyhole_signals.py``) with the path in its own
+    column, so two hotspots sharing a finding carry byte-identical directives.
+    Without the refusal a newly flagged file would inherit the completed status
+    of a different file that happened to share the phrase - the very false carry
+    the identity key exists to prevent.
+
+    The test is disjointness, not inequality. ``files`` is transcribed by the
+    model, so the same piece of work can gain or lose a path between runs - a
+    coupling action that named two files and now names three is still that
+    action, and refusing it would reset completed work, which is the defect this
+    change exists to remove. One file in common is enough to call it the same
+    work; none at all is what says otherwise.
+
+    The refusal reads the paths, not the identity keys, so it holds on both
+    sides even where no identity exists: ``finding`` is recommended and not
+    required, so either entry may name files while carrying no finding. An entry
+    naming no file at all is not evidence of different work - it is the shape a
+    pre-change contract and a judgement slot both have - so the text match
+    stands whenever either side has nothing to compare.
+
+    Where several prior entries share a directive, the one sharing a file wins
+    outright; an entry with nothing to compare is taken only if no candidate
+    shares a file, and the earliest such entry is taken, so the result follows
+    the contract's rank order rather than its file order.
+    """
+    identity = _action_identity_key(action)
+    if identity is not None and prior.get(identity):
+        return prior[identity][0]
+    text = _action_text_key(action)
+    if text is None:
+        return {}
+    new_paths = _action_paths(action)
+    nothing_to_compare: dict = {}
+    for candidate in prior.get(text, []):
+        prior_paths = _action_paths(candidate)
+        if new_paths and prior_paths:
+            if not new_paths.isdisjoint(prior_paths):
+                return candidate
+        elif not nothing_to_compare:
+            nothing_to_compare = candidate
+    return nothing_to_compare
 
 
 def _carry_status_fields(prior_entry: dict) -> dict:
@@ -302,8 +422,9 @@ def _write_actions_contract(
     actions.json persists: it is the artifact an executing agent reads to know
     what to do, how to verify it, where to stop, and - v2 - whether the work is
     still open. Status/claimed_by/completed_sha are carried forward from any
-    existing contract so a done action stays done across re-runs; ``mode`` is
-    derived deterministically from each action's ``finding`` type.
+    existing contract so a done action stays done across re-runs, matched on the
+    action's deterministic identity (finding plus paths) and falling back to its
+    directive text; ``mode`` is derived deterministically from ``finding``.
     """
     prior = _read_prior_action_status(assess_dir)
     valid = []
@@ -325,7 +446,7 @@ def _write_actions_contract(
         # v2 lifecycle + derived mode over it so those fields are authoritative.
         entry = {
             **a,
-            **_carry_status_fields(prior.get(a["action"], {})),
+            **_carry_status_fields(_match_prior_action(prior, a)),
             "mode": mode_for_finding(a.get("finding")),
         }
         entries.append(entry)
