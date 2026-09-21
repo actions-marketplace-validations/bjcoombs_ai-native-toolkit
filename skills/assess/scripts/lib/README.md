@@ -420,6 +420,31 @@ happens) and folds its hidden-seam direction into the `hidden_coupling` finding,
 Tier 1 result for `assess_core` to serialise into the `structure_drift` run-context block - so
 structure-drift findings flow through this barrier rather than being assembled in the orchestrator.
 
+The behaviour block exports the co-change pairs twice, at two scales. `change_coupling_pairs`
+is the repository-wide list, cut to `MAX_COUPLING_PAIRS` (100), and `change_coupling_pairs_total`
+beside it is the count *before* that cut, so a consumer can tell a complete list from a
+truncated one; the total is present and `0` on the unavailable path (no commit file-sets), never
+absent. Each `hidden_coupling` finding then carries its own `coupled_pairs` (at most
+`MAX_FINDING_COUPLED_PAIRS`, 5) and `coupled_pairs_total`. The per-finding candidates are the
+**full**, uncapped pair list: a directory's only coupling can rank below 100 repository-wide, and
+selecting from the already-capped list would drop exactly the pair the finding exists to explain.
+A pair belongs to a finding whose `path` is `D` when **exactly one** of `file_a` and `file_b` is
+inside `D`, a file being inside when it begins with `D + "/"` - a path-component test, so `src/app`
+does not claim `src/app2/x.py`. The finding reports commits bleeding across `D`'s boundary, and
+only a crossing pair is evidence of that: a pair wholly inside `D` is cohesion, and a pair wholly
+outside is about somewhere else. The exclusion matters most on an ancestor directory, where the
+internal seams of its own subtree carry the highest counts and would otherwise fill all five
+slots. The order is the repository-wide list's own (count descending, then path). The candidates
+are only pairs `change_coupling_pairs` reports: at least 3 co-changes (`min_support`), counted only
+in commits of at most 50 files (`MAX_COMMIT_FILES_FOR_COUPLING`), while larger commits still count
+toward the containment figure that flagged the directory. So `coupled_pairs_total: 0` means no
+crossing pair reached that floor, not that nothing co-changes with the directory. Selection is one
+pass over the pairs, filing each under the directories that hold exactly one of its files, so the
+cost grows with the pair count rather than with pairs times findings. Both keys are always written, so a
+finding with no matching pair reads as "none recorded" rather than "field absent";
+`hidden_coupling_findings` and `static_history_disagreement` share their record objects, so the
+keys appear on the hidden-coupling entries of both lists and on no other disagreement entry.
+
 **`coupling_analysis.py`**
 B3 static-vs-historical disagreement cross: compares the import-graph view
 (`structure_graph`) against the commit-history view (`change_coupling`) to surface

@@ -108,7 +108,11 @@ from lib.wiki_writer import (
 # step up its link path and the entry document that path starts from, so a
 # consumer can draw the strip without re-walking the graph. Additive: no
 # existing key moves, and complexity-stats.json is unchanged.
-ARTIFACT_SCHEMA_VERSION = "1.2.0"
+# 1.3.0: run-context.json behaviour gains coupled_pairs and coupled_pairs_total
+# on every hidden_coupling finding, and change_coupling_pairs_total on the block
+# so a list cut by the repository-wide cap never reads as complete.
+# complexity-stats.json is unchanged, so STATS_SCHEMA_VERSION stays put.
+ARTIFACT_SCHEMA_VERSION = "1.3.0"
 
 
 def _new_run_id() -> str:
