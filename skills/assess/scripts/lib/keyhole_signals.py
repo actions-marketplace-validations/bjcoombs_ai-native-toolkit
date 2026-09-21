@@ -52,6 +52,10 @@ from lib.understanding_analysis import analyze_understanding
 # Caps so a pathological repo can't bloat run-context.json. The treemap and
 # liveness blocks already cap their own lists; these bound the new ones.
 MAX_COUPLING_PAIRS = 100
+# Pairs exported onto a single hidden-coupling finding: a handful is evidence
+# enough for one directory, and `coupled_pairs_total` beside the list carries
+# the rest, so a cut list never reads as complete.
+MAX_FINDING_COUPLED_PAIRS = 5
 MAX_CONTAINMENT_DIRS = 50
 MAX_AUTHORSHIP_PATHS = 40
 MAX_ATTENTION_UNITS = 10
@@ -243,9 +247,91 @@ def _python_bearing_dirs(commit_sets: list[set[Path]]) -> set[str]:
     return out
 
 
+def _ancestor_dirs(path: str) -> list[str]:
+    """Every proper ancestor directory of a repo-relative ``path``, as posix.
+
+    Derived exactly as `_candidate_dirs` derives the directories it flags -
+    ``Path(path).parents``, each ``.as_posix()``, the root ``.`` dropped - so
+    the names compared here are always the names a finding carries. A pair's
+    paths come from ``str(Path)``, backslash-separated on Windows; splitting
+    them on a literal slash would match nothing there and ship every finding
+    an empty list. ``src/app2/x.py`` gives ``src/app2`` and ``src``, never
+    ``src/app``: a file is inside ``D`` exactly when it begins with ``D + "/"``.
+    """
+    out = []
+    for parent in Path(path).parents:
+        s = parent.as_posix()
+        if s != ".":
+            out.append(s)
+    return out
+
+
+def _attach_coupled_pairs(findings: list[dict], all_pairs: list[dict]) -> None:
+    """Export each finding's top coupled pairs, in place.
+
+    Candidates are the **full** pair list, before the repository-wide
+    ``MAX_COUPLING_PAIRS`` cut: a directory's own pair can rank below 100
+    repository-wide and still be the only coupling that directory has.
+    Selecting from the capped list is the defect this export exists to avoid.
+    A pair belongs to a flagged directory when **exactly one** of its files is
+    inside it: a hidden-coupling finding reports commits that bleed across the
+    directory's boundary, and only a crossing pair is evidence of that. A pair
+    wholly inside is cohesion, and on an ancestor directory such pairs carry the
+    highest counts, so admitting them would crowd the crossing pairs out of the
+    five slots. Order is the candidate list's own (count descending, then path),
+    and both keys are always written, so a finding with no pair reads as "none
+    recorded" rather than "field absent".
+
+    One pass over the pairs, filing each under the flagged ancestors of its two
+    files, rather than one pass per finding: the uncapped list can run to tens
+    of thousands of pairs.
+    """
+    if not findings:
+        # No static graph means no hidden_coupling findings at all; skip the
+        # walk over what can be a long uncapped list.
+        return
+    # Keep only the first MAX_FINDING_COUPLED_PAIRS per directory and count the
+    # rest, so memory stays bounded by the export rather than by the history.
+    kept: dict[str, list[dict]] = {f["path"]: [] for f in findings}
+    totals: dict[str, int] = dict.fromkeys(kept, 0)
+    for pair in all_pairs:
+        # Symmetric difference: the directories holding exactly one of the two
+        # files, which are the boundaries this pair crosses.
+        crossed = set(_ancestor_dirs(pair["file_a"])) ^ set(_ancestor_dirs(pair["file_b"]))
+        for d in crossed:
+            bucket = kept.get(d)
+            if bucket is None:
+                continue
+            totals[d] += 1
+            if len(bucket) < MAX_FINDING_COUPLED_PAIRS:
+                bucket.append(pair)
+    for finding in findings:
+        finding["coupled_pairs"] = kept[finding["path"]]
+        finding["coupled_pairs_total"] = totals[finding["path"]]
+
+
 # --------------------------------------------------------------------------
 # Block builders (pure transforms of upstream signal outputs)
 # --------------------------------------------------------------------------
+
+def _empty_behaviour_fields() -> dict:
+    """The behaviour block's data keys, empty, for both unavailable paths.
+
+    No history and a builder that raised are two routes to the same shape, so
+    they share one source: a data key added here is present on both unavailable
+    paths, and a consumer never meets it on one and not the other. Keys only the
+    available block carries (``static_modularity_projection``) are not listed.
+    Built fresh on each call so no two blocks share a list.
+    """
+    return {
+        "containment_by_dir": {},
+        "change_coupling_pairs": [],
+        "change_coupling_pairs_total": 0,
+        "static_history_disagreement": [],
+        "hidden_coupling_findings": [],
+        "refactor_boundaries": [],
+    }
+
 
 def build_behaviour_block(
     repo_root: Path, commit_sets: list[set[Path]], structure: dict | None,
@@ -255,14 +341,11 @@ def build_behaviour_block(
         return {
             "available": False,
             "reason": "no git history (commit file-sets empty)",
-            "containment_by_dir": {},
-            "change_coupling_pairs": [],
-            "static_history_disagreement": [],
-            "hidden_coupling_findings": [],
-            "refactor_boundaries": [],
+            **_empty_behaviour_fields(),
         }
     containment = containment_by_dir(repo_root, commit_sets)
-    pairs = change_coupling_pairs(commit_sets)[:MAX_COUPLING_PAIRS]
+    all_pairs = change_coupling_pairs(commit_sets)
+    pairs = all_pairs[:MAX_COUPLING_PAIRS]
     # Only project the (Python import-graph) static metrics onto Python-bearing
     # directories; a bleeding doc/config tree has no static evidence and
     # degrades to bleeding_module rather than a false hidden_coupling.
@@ -271,14 +354,17 @@ def build_behaviour_block(
     static_mod = project_static_modularity(structure, static_dirs)
     disagreement = detect_hidden_coupling(containment, static_modularity=static_mod)
     boundaries = find_refactor_boundaries(containment, static_modularity=static_mod)
+    hidden = [d for d in disagreement if d["finding"] == "hidden_coupling"]
+    # The two lists share their record objects, so writing here puts the keys
+    # on the hidden-coupling entries of both and on no other disagreement entry.
+    _attach_coupled_pairs(hidden, all_pairs)
     return {
         "available": True,
         "containment_by_dir": containment,
         "change_coupling_pairs": pairs,
+        "change_coupling_pairs_total": len(all_pairs),
         "static_history_disagreement": disagreement,
-        "hidden_coupling_findings": [
-            d for d in disagreement if d["finding"] == "hidden_coupling"
-        ],
+        "hidden_coupling_findings": hidden,
         "refactor_boundaries": boundaries,
         "static_modularity_projection": (
             "repo-level (coarse)" if static_mod is not None else "none"
@@ -1194,9 +1280,7 @@ def integrate(
     behaviour = _safe_block(
         "behaviour",
         lambda: build_behaviour_block(repo_root, commit_sets, structure),
-        {"containment_by_dir": {}, "change_coupling_pairs": [],
-         "static_history_disagreement": [], "hidden_coupling_findings": [],
-         "refactor_boundaries": []},
+        _empty_behaviour_fields(),
     )
 
     documentation = _safe_block(

@@ -728,7 +728,7 @@ def render(files: list[tuple[Path, int, float, str]],
 # ARTIFACT_SCHEMA_VERSION - the treemap runs as a separate process, so the
 # constant is duplicated rather than imported (no dependency on assess_core).
 # test_complexity_treemap asserts the two stay equal.
-ARTIFACT_SCHEMA_VERSION = "1.2.0"
+ARTIFACT_SCHEMA_VERSION = "1.3.0"
 
 
 def _new_run_id() -> str:
