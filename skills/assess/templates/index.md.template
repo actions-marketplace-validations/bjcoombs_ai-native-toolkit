@@ -13,9 +13,11 @@ Catalog of every hotspot ever flagged by `/assess` in this repo. Status reflects
 - **active** - in the latest top hotspots list
 - **new** - newly entered the hotspot list this run
 - **graduated** - was a hotspot, no longer is (good)
-- **regressed** - still a hotspot, and getting worse
+- **regressed** - still a hotspot, and getting worse. Any of: its worst function rose; its summed complexity rose by more than the worst function fell (an aggregate rise larger than the worst-function fall); or the worst function is flat or unmeasured and the sum or churn rose
+- **restructured** - still a hotspot; the sum or churn rose but the worst function fell by at least as much as the sum rose, the shape a split into named helpers leaves (good)
 - **persistent** - still a hotspot, roughly unchanged
+- **retired** - the source file was deleted or excluded; the page is kept for history
 
 ## How this gets updated
 
-Each `/assess` run reads this file, the prior `complexity-stats.json`, and the latest run output, then rewrites this index. Per-file detail lives in `hotspots/<slug>.md`. Run history lives in `log.md`.
+Each `/assess` run reads this file, the prior `complexity-stats.json`, and the latest run output, then rewrites this index. A file the latest run did not rank keeps its last known row, so no hotspot drops out of the catalog. Per-file detail lives in `hotspots/<slug>.md`. Run history lives in `log.md`.

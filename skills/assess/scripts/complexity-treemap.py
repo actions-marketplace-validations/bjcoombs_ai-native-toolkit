@@ -78,9 +78,10 @@ import shutil
 import subprocess
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import lizard
 import matplotlib.pyplot as plt
@@ -90,26 +91,26 @@ import numpy as np
 # heatmap, the docs heatmap, and the Layer 0 staleness metric reuse one
 # implementation. Only the colour mapping differs per heatmap and stays local.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib.assess_config import resolve_excludes  # noqa: E402
-from lib.dart_complexity import (  # noqa: E402
+from lib.assess_config import resolve_excludes
+from lib.dart_complexity import (
     BACKEND_NAME as DART_BACKEND,
     dart_function_scores,
 )
-from lib.git_churn import (  # noqa: E402
+from lib.git_churn import (
     churn_is_degenerate,
     git_churn_scores,
     pick_churn_window,
 )
-from lib.generated_files import (  # noqa: E402
+from lib.generated_files import (
     GENERATED_NAME_PATTERNS,
     generated_reason,
 )
-from lib.treemap_render import (  # noqa: E402
-    adaptive_cap,
-    blend_to_grey,
-    build_tree,
-    layout,
-    write_svg,
+from lib.run_context_types import (
+    Distribution, FnCcnBlock, GeneratedExclusion, HotspotRow, KeyholeBudget,
+    ScoredHotspotRow, SizeBlock, SubtreeTokens,
+)
+from lib.treemap_render import (
+    ColoredFile, Rect, Rgba, adaptive_cap, blend_to_grey, build_tree, layout, plural, write_svg,
 )
 
 
@@ -117,10 +118,10 @@ EXCLUDE_DIRS = {".git", "node_modules", "dist", "build", "target", "vendor",
                 ".venv", "venv", "__pycache__", ".gradle", ".idea", ".mvn",
                 "worktree", ".understand-anything", ".obsidian",
                 ".taskmaster", ".claude",
-                # /assess's own output directory. Without this the prior
-                # run's run-context.json (often 2,000+ LOC) gets picked up
-                # as a top-large file on every re-run - circular pollution.
-                ".assess",
+                # /assess's own output, else a prior run-context.json (often
+                # 2,000+ LOC) is scored on every re-run; and mutmut 3's local
+                # mutants/ tree, copies of sources and tests counted twice.
+                ".assess", "mutants",
                 # modern web framework build outputs
                 ".next", ".nuxt", ".output", ".svelte-kit", ".astro",
                 "out", "coverage", "htmlcov",
@@ -388,7 +389,7 @@ def collect(root: Path, by: str = "complexity",
             extra_exclude_dirs: set[str] | None = None,
             extra_exclude_patterns: list[str] | None = None,
             scope: Path | None = None,
-            excluded_generated: list[dict] | None = None,
+            excluded_generated: list[GeneratedExclusion] | None = None,
             scc_languages: dict[Path, str] | None = None,
             fn_names: dict[Path, str] | None = None,
             fn_backends: dict[Path, str] | None = None,
@@ -618,7 +619,7 @@ def _hatch_for_density(density: float | None) -> str:
 def _survivor_overrides(
     files: list[tuple[Path, int, float, str]],
     survivor_density: dict[Path, float] | None,
-) -> dict[Path, dict]:
+) -> dict[Path, dict[str, str]]:
     """Build the per-file Node overrides (``{path: {"hatch": ...}}``) for the
     survivor-density overlay. Keys in ``survivor_density`` are matched against
     each file's resolved path (``files[i][0]``). Returns an empty dict when no
@@ -626,12 +627,78 @@ def _survivor_overrides(
     as "no overlay"."""
     if not survivor_density:
         return {}
-    overrides: dict[Path, dict] = {}
+    overrides: dict[Path, dict[str, str]] = {}
     for f in files:
         hatch = _hatch_for_density(survivor_density.get(f[0]))
         if hatch:
             overrides[f[0]] = {"hatch": hatch}
     return overrides
+
+
+def _aux_cap(files: list[tuple[Path, int, float, str]],
+             aux_data: dict[Path, int] | None) -> tuple[float, str]:
+    """The saturation cap and its kind; (1.0, "") when there is no aux axis."""
+    if aux_data is None:
+        return 1.0, ""
+    return adaptive_cap([float(aux_data.get(f[0], 0)) for f in files])
+
+
+def _colour_files(files: list[tuple[Path, int, float, str]],
+                  cmap: Callable[[float], Rgba], cap: float,
+                  aux_data: dict[Path, int] | None, aux_cap: float) -> list[ColoredFile]:
+    """Append each file's fill: hue from its metric, greyed by its aux value."""
+    files_colored: list[ColoredFile] = []
+    for f in files:
+        # Floor the ramp at 0.12 so the calm (low-complexity) end is a visible
+        # pale orange, not near-white that washes out against the white canvas.
+        base = cmap(0.12 + 0.88 * min(f[2] / cap, 1.0))
+        if aux_data is not None:
+            aux_val = float(aux_data.get(f[0], 0))
+            color = blend_to_grey(base, aux_val / aux_cap)
+        else:
+            color = base
+        files_colored.append((f[0], f[1], f[2], f[3], color))
+    return files_colored
+
+
+def _print_axes(files: list[tuple[Path, int, float, str]], metric_label: str,
+                cap: float, cap_kind: str, *, churn_degenerate: bool,
+                aux_data: dict[Path, int] | None, aux_label: str | None,
+                aux_cap: float, aux_cap_kind: str) -> None:
+    """One console line per colour axis: the hue range and cap, then the
+    saturation range and cap (or why the saturation axis is inactive)."""
+    mx = float(max(f[2] for f in files)) if files else 0.0
+    print(f"hue: {metric_label}; range 0-{mx:.0f}; "
+          f"cap {cap:.0f} ({cap_kind})")
+    if churn_degenerate:
+        print("saturation: churn signal flat (degenerate history - every file "
+              "~1 commit); axis inactive, rendering pure complexity.")
+    elif aux_data is not None:
+        aux_max = max((float(aux_data.get(f[0], 0)) for f in files),
+                       default=0.0)
+        print(f"saturation: {aux_label}; range 0-{aux_max:.0f}; "
+              f"cap {aux_cap:.0f} ({aux_cap_kind})")
+
+
+def _print_biggest(files: list[tuple[Path, int, float, str]], root: Path,
+                   tokens: dict[Path, int], metric_label: str,
+                   aux_data: dict[Path, int] | None, aux_label: str | None) -> None:
+    """The five files with the most estimated tokens, which dominate the layout."""
+    # Counts a path with no token estimate as 0, unlike the scc-only hint.
+    biggest = _largest_first(files, lambda f: tokens.get(f[0], 0), 5)
+    if not biggest:
+        return
+    print("biggest files (estimated tokens dominate layout):")
+    for path, loc, metric, src in biggest:
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            rel = path
+        aux_str = ""
+        if aux_data is not None:
+            aux_str = f"  {aux_label} {aux_data.get(path, 0):>4d}"
+        print(f"  {tokens.get(path, 0):>9,} est.tok  {loc:>7} loc  "
+              f"{metric_label} {metric:>5.0f}{aux_str}  [{src:6}]  {rel}")
 
 
 def render(files: list[tuple[Path, int, float, str]],
@@ -644,8 +711,7 @@ def render(files: list[tuple[Path, int, float, str]],
            tokens_by_path: dict[Path, int] | None = None,
            churn_degenerate: bool = False) -> None:
     metric_label = "commits" if by == "churn" else "ccn"
-    metrics = [f[2] for f in files]
-    cap, cap_kind = adaptive_cap(metrics)
+    cap, cap_kind = adaptive_cap([f[2] for f in files])
     # OrRd (ColorBrewer): colour-blind-safe sequential ramp, pale = simple ->
     # dark red = complex. Avoids the red-green of RdYlGn (the most common CVD).
     cmap = plt.get_cmap("OrRd")
@@ -658,23 +724,8 @@ def render(files: list[tuple[Path, int, float, str]],
     if churn_degenerate:
         aux_data = None
 
-    aux_cap = 1.0
-    aux_cap_kind = ""
-    if aux_data is not None:
-        aux_values = [float(aux_data.get(f[0], 0)) for f in files]
-        aux_cap, aux_cap_kind = adaptive_cap(aux_values)
-
-    files_colored = []
-    for f in files:
-        # Floor the ramp at 0.12 so the calm (low-complexity) end is a visible
-        # pale orange, not near-white that washes out against the white canvas.
-        base = cmap(0.12 + 0.88 * min(f[2] / cap, 1.0))
-        if aux_data is not None:
-            aux_val = float(aux_data.get(f[0], 0))
-            color = blend_to_grey(base, aux_val / aux_cap)
-        else:
-            color = base
-        files_colored.append((f[0], f[1], f[2], f[3], color))
+    aux_cap, aux_cap_kind = _aux_cap(files, aux_data)
+    files_colored = _colour_files(files, cmap, cap, aux_data, aux_cap)
 
     # Block area is estimated tokens (the keyhole size unit), not LOC: size_by
     # overrides the layout area per file while each leaf keeps its real LOC for
@@ -685,50 +736,28 @@ def render(files: list[tuple[Path, int, float, str]],
     tree = build_tree(files_colored, root, aux_data, aux_label or "",
                       node_overrides=overrides or None, size_by=tokens)
     W, H = 1600.0, 1000.0
-    rects: list = []
+    rects: list[Rect] = []
     layout(tree, 0, 0, W, H, rects)
 
     write_svg(rects, root, W, H, out_path, show_labels, metric_label,
               show_survivor_legend=bool(overrides))
 
-    print(f"wrote {out_path}  ({len(files)} files, "
+    print(f"wrote {out_path}  ({len(files)} {plural(len(files), 'file')}, "
           f"{sum(1 for f in files if f[3] == 'lizard')} lizard, "
           f"{sum(1 for f in files if f[3] == 'scc')} scc)")
-    mx = float(max(metrics)) if metrics else 0.0
-    print(f"hue: {metric_label}; range 0-{mx:.0f}; "
-          f"cap {cap:.0f} ({cap_kind})")
-    if churn_degenerate:
-        print("saturation: churn signal flat (degenerate history - every file "
-              "~1 commit); axis inactive, rendering pure complexity.")
-    elif aux_data is not None:
-        aux_max = max((float(aux_data.get(f[0], 0)) for f in files),
-                       default=0.0)
-        print(f"saturation: {aux_label}; range 0-{aux_max:.0f}; "
-              f"cap {aux_cap:.0f} ({aux_cap_kind})")
-
-    # Counts a path with no token estimate as 0, unlike the scc-only hint.
-    biggest = _largest_first(files, lambda f: tokens.get(f[0], 0), 5)
-    if biggest:
-        print("biggest files (estimated tokens dominate layout):")
-        for path, loc, metric, src in biggest:
-            try:
-                rel = path.relative_to(root)
-            except ValueError:
-                rel = path
-            aux_str = ""
-            if aux_data is not None:
-                aux_str = f"  {aux_label} {aux_data.get(path, 0):>4d}"
-            print(f"  {tokens.get(path, 0):>9,} est.tok  {loc:>7} loc  "
-                  f"{metric_label} {metric:>5.0f}{aux_str}  [{src:6}]  {rel}")
+    _print_axes(files, metric_label, cap, cap_kind,
+                churn_degenerate=churn_degenerate, aux_data=aux_data,
+                aux_label=aux_label, aux_cap=aux_cap, aux_cap_kind=aux_cap_kind)
+    _print_biggest(files, root, tokens, metric_label, aux_data, aux_label)
 
 
 # Artifact schema version for complexity-stats.json - the run_id provenance
 # schema (distinct from STATS_SCHEMA_VERSION below, which versions the stats
-# *layout* for diff comparability). Mirrors assess_core's
-# ARTIFACT_SCHEMA_VERSION - the treemap runs as a separate process, so the
-# constant is duplicated rather than imported (no dependency on assess_core).
+# *layout* for diff comparability). Mirrors lib/artifact_schema.py's
+# ARTIFACT_SCHEMA_VERSION, which assess_core stamps on run-context.json; the
+# treemap keeps its own copy of the constant.
 # test_complexity_treemap asserts the two stay equal.
-ARTIFACT_SCHEMA_VERSION = "1.3.0"
+ARTIFACT_SCHEMA_VERSION = "1.4.0"
 
 
 def _new_run_id() -> str:
@@ -759,7 +788,7 @@ def _read_plugin_version() -> str:
 # diff is only trustworthy when both snapshots share this schema; a bump here
 # is a structural change to the sidecar shape (a metric added/removed/redefined)
 # that voids the diff against an older snapshot until the next clean run
-# re-seeds the baseline (assess_core._diff_is_reliable reads it).
+# re-seeds the baseline (lib.diff_reliability._diff_is_reliable reads it).
 STATS_SCHEMA_VERSION = 5  # 2: generated-file content excludes + excluded_generated
                           # 3: generated test-report excludes + loc/est_tokens max_code/max_data
                           # 4: fn_ccn.source list + backend_by_language, rows max_fn_name
@@ -879,7 +908,7 @@ def est_tokens_by_path(
 def _keyhole_budget_rollup(
     tokens: dict[Path, int], root: Path,
     budget: int = CONTEXT_WINDOW_BUDGET_TOKENS,
-) -> dict:
+) -> KeyholeBudget:
     """Roll per-file estimated tokens into the keyhole-budget finding.
 
     Reports the repo total and how many individual files / top-level subtrees
@@ -899,11 +928,13 @@ def _keyhole_budget_rollup(
         # a directory maps to that directory.
         top = rel.parts[0] if rel.parts else rel.name
         subtree_totals[top] = subtree_totals.get(top, 0) + t
-    over_subtrees = sorted(
-        ({"path": name, "est_tokens": tot}
-         for name, tot in subtree_totals.items() if tot > budget),
-        key=lambda s: -s["est_tokens"],
-    )
+    # Sort the (name, tokens) pairs before building the dicts, so the key reads
+    # an int rather than a value of the mixed-type row.
+    over_subtrees: list[SubtreeTokens] = [
+        {"path": name, "est_tokens": tot}
+        for name, tot in sorted(subtree_totals.items(), key=lambda kv: -kv[1])
+        if tot > budget
+    ]
     return {
         "total": total,
         "budget": budget,
@@ -943,6 +974,196 @@ def _effective_ccn(ccn: float, max_fn_ccn: float | None) -> float:
     return float(max_fn_ccn ** w * ccn ** (1.0 - w))
 
 
+def _pct(values: Sequence[float], q: float) -> float:
+    return float(np.percentile(values, q)) if values else 0.0
+
+
+def _distribution(values: Sequence[float]) -> Distribution:
+    """``{p50, p95, max}`` of ``values``; every field 0.0 when empty."""
+    return {
+        "p50": _pct(values, 50),
+        "p95": _pct(values, 95),
+        "max": float(max(values)) if values else 0.0,
+    }
+
+
+def _side_max(values: Sequence[float], is_data: list[bool], data: bool) -> float:
+    """Largest of ``values`` on the code (``data=False``) or data side."""
+    side = [v for v, d in zip(values, is_data) if d is data]
+    return float(max(side)) if side else 0.0
+
+
+def _size_block(values: Sequence[int], is_data: list[bool]) -> SizeBlock:
+    """The ``loc`` / ``est_tokens`` block: distribution, code/data maxima, total."""
+    return {
+        **_distribution(values),
+        "max_code": _side_max(values, is_data, False),
+        "max_data": _side_max(values, is_data, True),
+        "total": sum(values),
+    }
+
+
+def _rel_path(p: Path, root: Path) -> str:
+    # Forward slashes on every host, matching `excluded_generated` (built
+    # in `collect`), so assess_core can compare the two path sets on Windows.
+    try:
+        return p.relative_to(root).as_posix()
+    except ValueError:
+        return p.as_posix()
+
+
+def _max_fn(fn_ccn_by_path: dict[Path, list[float]], path: Path) -> float | None:
+    vals = fn_ccn_by_path.get(path)
+    return float(max(vals)) if vals else None
+
+
+def _scoring_coverage(files: list[tuple[Path, int, float, str]]) -> dict[str, int]:
+    return {
+        "lizard": sum(1 for f in files if f[3] == "lizard"),
+        "scc": sum(1 for f in files if f[3] == "scc"),
+    }
+
+
+def _backend_by_language(
+    files: list[tuple[Path, int, float, str]],
+    langs: dict[Path, str],
+    backend_of: dict[Path, str],
+) -> dict[str, str | None]:
+    """Map each scc language to its per-function backend, or None.
+
+    See ``write_stats`` for which languages get a key.
+    """
+    covered: dict[str, str] = {}
+    uncovered: set[str] = set()
+    for path, _loc, metric, _src in files:
+        lang = langs.get(path)
+        if not lang:
+            continue
+        if path in backend_of:
+            covered[lang] = backend_of[path]
+        elif metric > 0 and lang not in DATA_LANGUAGES:
+            uncovered.add(lang)
+    # A language counts as covered only when no file of it with decision points
+    # fell back to scc: partial coverage reads as null, not as the backend.
+    return {
+        lang: (None if lang in uncovered else covered[lang])
+        for lang in covered.keys() | uncovered
+    }
+
+
+def _enrich_row(path: Path, loc: int, ccn: float, src: str, *,
+                aux_data: dict[Path, int] | None,
+                tokens: dict[Path, int], root: Path,
+                fn_ccn_by_path: dict[Path, list[float]],
+                fn_names: dict[Path, str]) -> ScoredHotspotRow:
+    """One hotspot row, carrying the private ``_score`` ranking key."""
+    churn = float(aux_data.get(path, 0)) if aux_data else 0.0
+    est_tokens = tokens.get(path, est_token_count(path, loc))
+    max_fn_ccn = _max_fn(fn_ccn_by_path, path)
+    return {
+        "path": _rel_path(path, root),
+        "loc": int(loc),
+        # Estimated tokens (~chars/4), the size unit the treemap blocks and
+        # the hotspot composite use. `loc` is kept alongside (tooltip +
+        # back-compat). An estimate, not a model-exact count.
+        "est_tokens": int(est_tokens),
+        # File-level aggregate (sum of per-function ccn). See `max_fn_ccn`
+        # for the per-function worst case the linter threshold gates.
+        "ccn": float(ccn),
+        "ccn_basis": "file-aggregate",
+        "max_fn_ccn": max_fn_ccn,
+        # Name of the function whose ccn is max_fn_ccn; null with it.
+        "max_fn_name": (fn_names.get(path)
+                        if max_fn_ccn is not None else None),
+        # Named `commits` to match what every consumer reads (stats_diff,
+        # assess_core, the hotspot template). None when churn is unavailable
+        # (no git), so a missing value is distinct from a real 0.
+        "commits": int(churn) if aux_data else None,
+        "source": src,
+        # Ranked on the per-function-weighted effective complexity, recent
+        # churn, AND context-window size - each sqrt-damped so the worst
+        # keyhole (high on multiple axes) leads and no single axis can top
+        # the list alone (issue #115 for the ccn re-weight; PRD 2026-06 for
+        # the token axis). The `ccn`/`loc` fields above stay raw for the hue
+        # and the Layer 3 comparison.
+        "_score": math.sqrt(_effective_ccn(ccn, max_fn_ccn))
+        * math.sqrt(1.0 + churn)
+        * math.sqrt(est_tokens),
+    }
+
+
+def _fn_ccn_block(files: list[tuple[Path, int, float, str]],
+                  fn_ccn_by_path: dict[Path, list[float]],
+                  fn_backend_by_path: dict[Path, str] | None,
+                  langs: dict[Path, str]) -> FnCcnBlock:
+    """The per-function ``fn_ccn`` block of the stats sidecar."""
+    backend_of = {p: (fn_backend_by_path or {}).get(p, "lizard")
+                  for p in fn_ccn_by_path}
+    # Per-function population, per-function backends only. Other scc paths are
+    # absent from fn_ccn_by_path, so they don't contribute - the block
+    # self-labels its sources so a reader knows what it omits.
+    fn_population: list[float] = []
+    for vals in fn_ccn_by_path.values():
+        fn_population.extend(vals)
+
+    backends_used = sorted({backend_of[f[0]] for f in files
+                            if f[0] in backend_of})
+    backend_by_language = _backend_by_language(files, langs, backend_of)
+    return {
+        "basis": "per-function",
+        "source": [{"name": n, "approximate": FN_BACKENDS.get(n, False)}
+                   for n in backends_used],
+        "backend_by_language": dict(sorted(backend_by_language.items())),
+        "function_count": len(fn_population),
+        **_distribution(fn_population),
+    }
+
+
+def _provenance(files: list[tuple[Path, int, float, str]]) -> dict[str, object]:
+    """Run-provenance keys that open the stats sidecar."""
+    tool_versions = _tool_versions(files)
+    return {
+        # Run provenance: the artifact schema and a unique id for this emission
+        # (distinct from schema_version below, which versions the stats layout).
+        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+        "run_id": _new_run_id(),
+        "plugin_version": _read_plugin_version(),
+        # Layout version of this sidecar. A cross-run diff is only comparable
+        # when both snapshots share it (lib.diff_reliability._diff_is_reliable).
+        "schema_version": STATS_SCHEMA_VERSION,
+        # The complexity backends and their captured versions. A backend version
+        # change can shift scores, so a later run flags the diff as not
+        # comparable and names the tool. lizard is always present; scc only when
+        # it scored files.
+        "lizard_version": tool_versions["lizard"],
+        **({"scc_version": tool_versions["scc"]} if "scc" in tool_versions else {}),
+    }
+
+
+def _strip_score(rows: list[ScoredHotspotRow]) -> list[HotspotRow]:
+    return [cast(HotspotRow, {k: v for k, v in r.items() if k != "_score"}) for r in rows]
+
+
+def _top_lists(enriched: list[ScoredHotspotRow]) -> dict[str, list[HotspotRow]]:
+    """``top_hotspots`` / ``top_complex`` / ``top_large``, ten rows each."""
+    # Ties break on the repository-relative path, ascending, under Python's
+    # default byte ordering for `str`. Without it a stable single-key sort
+    # hands ties back in scanner emission order, so which of a tied group
+    # makes the top ten depends on how lizard and scc happened to enumerate
+    # the tree - and membership of `top_hotspots` decides which files get a
+    # wiki page and a first-flagged date (issue #426). The primary keys are
+    # unchanged, so no file moves when the values differ; this is the same
+    # `(-primary, path)` shape the attention list took in #357.
+    by_score = sorted(enriched, key=lambda f: (-f["_score"], f["path"]))
+    by_ccn = sorted(enriched, key=lambda f: (-f["ccn"], f["path"]))
+    by_loc = sorted(enriched, key=lambda f: (-f["loc"], f["path"]))
+    return {
+        "top_hotspots": _strip_score(by_score[:10]),
+        "top_complex": _strip_score(by_ccn[:10]),
+        "top_large": _strip_score(by_loc[:10]),
+    }
+
+
 def write_stats(files: list[tuple[Path, int, float, str]],
                 aux_data: dict[Path, int] | None,
                 aux_label: str | None,
@@ -950,7 +1171,7 @@ def write_stats(files: list[tuple[Path, int, float, str]],
                 fn_ccn_by_path: dict[Path, list[float]] | None = None,
                 tokens_by_path: dict[Path, int] | None = None,
                 churn_degenerate: bool = False,
-                excluded_generated: list[dict] | None = None,
+                excluded_generated: list[GeneratedExclusion] | None = None,
                 languages_by_path: dict[Path, str] | None = None,
                 fn_name_by_path: dict[Path, str] | None = None,
                 fn_backend_by_path: dict[Path, str] | None = None) -> None:
@@ -1016,8 +1237,6 @@ def write_stats(files: list[tuple[Path, int, float, str]],
     """
     fn_ccn_by_path = fn_ccn_by_path or {}
     fn_names = fn_name_by_path or {}
-    backend_of = {p: (fn_backend_by_path or {}).get(p, "lizard")
-                  for p in fn_ccn_by_path}
     tokens = tokens_by_path if tokens_by_path is not None else est_tokens_by_path(files)
     locs = [f[1] for f in files]
     token_vals = [tokens.get(f[0], est_token_count(f[0], f[1])) for f in files]
@@ -1025,127 +1244,23 @@ def write_stats(files: list[tuple[Path, int, float, str]],
     langs = languages_by_path or {}
     is_data = [langs.get(f[0]) in DATA_LANGUAGES for f in files]
 
-    def side_max(values: list, data: bool) -> float:
-        side = [v for v, d in zip(values, is_data) if d is data]
-        return float(max(side)) if side else 0.0
-
     churns = ([float(aux_data.get(f[0], 0)) for f in files]
               if aux_data is not None else [])
-    # Per-function population, per-function backends only. Other scc paths are
-    # absent from fn_ccn_by_path, so they don't contribute - the block
-    # self-labels its sources so a reader knows what it omits.
-    fn_population: list[float] = []
-    for vals in fn_ccn_by_path.values():
-        fn_population.extend(vals)
 
-    def pct(values: list[float], q: float) -> float:
-        return float(np.percentile(values, q)) if values else 0.0
+    enriched = [
+        _enrich_row(path, loc, ccn, src, aux_data=aux_data, tokens=tokens,
+                    root=root, fn_ccn_by_path=fn_ccn_by_path,
+                    fn_names=fn_names)
+        for path, loc, ccn, src in files
+    ]
 
-    def rel(p: Path) -> str:
-        # Forward slashes on every host, matching `excluded_generated` (built
-        # in `collect`), so assess_core can compare the two path sets on Windows.
-        try:
-            return p.relative_to(root).as_posix()
-        except ValueError:
-            return p.as_posix()
-
-    def max_fn(path: Path) -> float | None:
-        vals = fn_ccn_by_path.get(path)
-        return float(max(vals)) if vals else None
-
-    backends_used = sorted({backend_of[f[0]] for f in files
-                            if f[0] in backend_of})
-    covered: dict[str, str] = {}
-    uncovered: set[str] = set()
-    for path, _loc, metric, _src in files:
-        lang = langs.get(path)
-        if not lang:
-            continue
-        if path in backend_of:
-            covered[lang] = backend_of[path]
-        elif metric > 0 and lang not in DATA_LANGUAGES:
-            uncovered.add(lang)
-    # A language counts as covered only when no file of it with decision points
-    # fell back to scc: partial coverage reads as null, not as the backend.
-    backend_by_language: dict[str, str | None] = {
-        lang: (None if lang in uncovered else covered[lang])
-        for lang in covered.keys() | uncovered
-    }
-
-    enriched = []
-    for path, loc, ccn, src in files:
-        churn = float(aux_data.get(path, 0)) if aux_data else 0.0
-        est_tokens = tokens.get(path, est_token_count(path, loc))
-        enriched.append({
-            "path": rel(path),
-            "loc": int(loc),
-            # Estimated tokens (~chars/4), the size unit the treemap blocks and
-            # the hotspot composite use. `loc` is kept alongside (tooltip +
-            # back-compat). An estimate, not a model-exact count.
-            "est_tokens": int(est_tokens),
-            # File-level aggregate (sum of per-function ccn). See `max_fn_ccn`
-            # for the per-function worst case the linter threshold gates.
-            "ccn": float(ccn),
-            "ccn_basis": "file-aggregate",
-            "max_fn_ccn": max_fn(path),
-            # Name of the function whose ccn is max_fn_ccn; null with it.
-            "max_fn_name": (fn_names.get(path)
-                            if max_fn(path) is not None else None),
-            # Named `commits` to match what every consumer reads (stats_diff,
-            # assess_core, the hotspot template). None when churn is unavailable
-            # (no git), so a missing value is distinct from a real 0.
-            "commits": int(churn) if aux_data else None,
-            "source": src,
-            # Ranked on the per-function-weighted effective complexity, recent
-            # churn, AND context-window size - each sqrt-damped so the worst
-            # keyhole (high on multiple axes) leads and no single axis can top
-            # the list alone (issue #115 for the ccn re-weight; PRD 2026-06 for
-            # the token axis). The `ccn`/`loc` fields above stay raw for the hue
-            # and the Layer 3 comparison.
-            "_score": math.sqrt(_effective_ccn(ccn, max_fn(path)))
-            * math.sqrt(1.0 + churn)
-            * math.sqrt(est_tokens),
-        })
-
-    def strip(rows: list[dict]) -> list[dict]:
-        return [{k: v for k, v in r.items() if k != "_score"} for r in rows]
-
-    # Ties break on the repository-relative path, ascending, under Python's
-    # default byte ordering for `str`. Without it a stable single-key sort
-    # hands ties back in scanner emission order, so which of a tied group
-    # makes the top ten depends on how lizard and scc happened to enumerate
-    # the tree - and membership of `top_hotspots` decides which files get a
-    # wiki page and a first-flagged date (issue #426). The primary keys are
-    # unchanged, so no file moves when the values differ; this is the same
-    # `(-primary, path)` shape the attention list took in #357.
-    by_score = sorted(enriched, key=lambda f: (-f["_score"], f["path"]))
-    by_ccn = sorted(enriched, key=lambda f: (-f["ccn"], f["path"]))
-    by_loc = sorted(enriched, key=lambda f: (-f["loc"], f["path"]))
-
-    tool_versions = _tool_versions(files)
-    stats: dict = {
-        # Run provenance: the artifact schema and a unique id for this emission
-        # (distinct from schema_version below, which versions the stats layout).
-        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
-        "run_id": _new_run_id(),
-        "plugin_version": _read_plugin_version(),
-        # Layout version of this sidecar. A cross-run diff is only comparable
-        # when both snapshots share it (assess_core._diff_is_reliable).
-        "schema_version": STATS_SCHEMA_VERSION,
-        # The complexity backends and their captured versions. A backend version
-        # change can shift scores, so a later run flags the diff as not
-        # comparable and names the tool. lizard is always present; scc only when
-        # it scored files.
-        "lizard_version": tool_versions["lizard"],
-        **({"scc_version": tool_versions["scc"]} if "scc" in tool_versions else {}),
+    stats: dict[str, object] = {
+        **_provenance(files),
         "files_scored": len(files),
         # Files dropped by content (generator header, payload-length lines):
         # [{path, reason}]. assess_core copies it into run-context.json.
         "excluded_generated": list(excluded_generated or []),
-        "scoring_coverage": {
-            "lizard": sum(1 for f in files if f[3] == "lizard"),
-            "scc": sum(1 for f in files if f[3] == "scc"),
-        },
+        "scoring_coverage": _scoring_coverage(files),
         "churn_window": aux_label,
         # Churn-measurement reliability (lib.git_churn.churn_is_degenerate). True
         # when the history is degenerate - every file ~1 commit - so the
@@ -1153,59 +1268,28 @@ def write_stats(files: list[tuple[Path, int, float, str]],
         # term (sqrt(1 + commits)) is near-constant. A reader (and the report)
         # treats the `commits` column and saturation axis as inactive here.
         "churn_degenerate": bool(churn_degenerate),
-        "loc": {
-            "p50": pct(locs, 50),
-            "p95": pct(locs, 95),
-            "max": float(max(locs)) if locs else 0.0,
-            # The maxima split by scc language (DATA_LANGUAGES), so a large
-            # JSON fixture cannot pass for the largest source file.
-            "max_code": side_max(locs, False),
-            "max_data": side_max(locs, True),
-            "total": sum(locs),
-        },
+        # The maxima split by scc language (DATA_LANGUAGES), so a large
+        # JSON fixture cannot pass for the largest source file.
+        "loc": _size_block(locs, is_data),
         # Estimated tokens (~chars/4) - the keyhole size unit. Sized the treemap
         # blocks and feeds the hotspot composite. `budget` rolls the per-file
         # totals into the "does the relevant slice fit one keyhole?" finding.
         "est_tokens": {
-            "p50": pct(token_vals, 50),
-            "p95": pct(token_vals, 95),
-            "max": float(max(token_vals)) if token_vals else 0.0,
-            "max_code": side_max(token_vals, False),
-            "max_data": side_max(token_vals, True),
-            "total": sum(token_vals),
+            **_size_block(token_vals, is_data),
             "budget": _keyhole_budget_rollup(tokens, root),
         },
         # File-level aggregate complexity (sum per file). Drives the treemap hue
         # and the hotspot composite - NOT comparable to a per-function linter
         # threshold. Use `fn_ccn` for that comparison.
-        "ccn": {
-            "basis": "file-aggregate",
-            "p50": pct(ccns, 50),
-            "p95": pct(ccns, 95),
-            "max": float(max(ccns)) if ccns else 0.0,
-        },
+        "ccn": {"basis": "file-aggregate", **_distribution(ccns)},
         # Per-function complexity distribution (the unit a linter threshold like
         # cyclop:15 actually gates). Per-function backends only; scc files
         # contribute no function breakdown. `function_count` is 0 when only scc
         # scored the repo. `backend_by_language` null = no per-function data.
-        "fn_ccn": {
-            "basis": "per-function",
-            "source": [{"name": n, "approximate": FN_BACKENDS.get(n, False)}
-                       for n in backends_used],
-            "backend_by_language": dict(sorted(backend_by_language.items())),
-            "function_count": len(fn_population),
-            "p50": pct(fn_population, 50),
-            "p95": pct(fn_population, 95),
-            "max": float(max(fn_population)) if fn_population else 0.0,
-        },
-        "churn": ({
-            "p50": pct(churns, 50),
-            "p95": pct(churns, 95),
-            "max": float(max(churns)) if churns else 0.0,
-        } if aux_data is not None else None),
-        "top_hotspots": strip(by_score[:10]),
-        "top_complex": strip(by_ccn[:10]),
-        "top_large": strip(by_loc[:10]),
+        "fn_ccn": _fn_ccn_block(files, fn_ccn_by_path, fn_backend_by_path,
+                                langs),
+        "churn": (_distribution(churns) if aux_data is not None else None),
+        **_top_lists(enriched),
     }
 
     out_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
@@ -1254,7 +1338,7 @@ def load_survivor_density(run_context_path: Path,
     return density
 
 
-def main() -> int:
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=(
             "Render a Codecov-style hotspot treemap of any folder. "
@@ -1314,6 +1398,58 @@ def main() -> int:
               "carries no signal from a sibling directory. Omit for a whole-repo "
               "run."),
     )
+    return ap
+
+
+def _resolve_scope(root: Path, scope_arg: Path | None) -> tuple[Path | None, str | None]:
+    """The resolved ``--scope`` subtree, or an error message when it does not
+    exist or sits outside ``root``. (None, None) for a whole-repo run."""
+    if scope_arg is None:
+        return None, None
+    scope = scope_arg if scope_arg.is_absolute() else (root / scope_arg)
+    scope = scope.resolve()
+    if not scope.exists():
+        return None, f"error: scope path {scope} does not exist"
+    if not scope.is_relative_to(root):
+        return None, f"error: scope path {scope} is not under {root}"
+    return scope, None
+
+
+def _no_files_message(scope: Path | None, excluded_generated: list[GeneratedExclusion]) -> str:
+    """The dead-end error when nothing is left to score."""
+    where = f" under {scope}" if scope is not None else ""
+    # Content excludes can drop every file (an all-generated SDK subtree
+    # under --scope); name them so the dead end explains itself.
+    why = (
+        f" ({len(excluded_generated)} excluded as generated - pass "
+        f"--include-artifacts to score them)"
+        if excluded_generated else ""
+    )
+    return f"error: no scoreable files found{where}{why}"
+
+
+def _out_path_and_title(root: Path, scope: Path | None,
+                        out_arg: Path | None) -> tuple[Path, str]:
+    """The SVG path (``-o`` or a name derived from the root and scope) and the
+    treemap title."""
+    scope_label = (
+        str(scope.relative_to(root)) if scope is not None and scope != root
+        else None
+    )
+    default_name = (
+        f"hotspot-{root.name}-{scope_label.replace('/', '-')}.svg"
+        if scope_label else f"hotspot-{root.name}.svg"
+    )
+    out = out_arg or Path(default_name)
+    title = (
+        f"Hotspot: {root.name}/{scope_label}" if scope_label
+        else f"Hotspot: {root.name}"
+    )
+    return out, title
+
+
+def main() -> int:
+    ap = _build_parser()
     args = ap.parse_args()
 
     root = args.path.resolve()
@@ -1321,17 +1457,10 @@ def main() -> int:
         print(f"error: {root} is not a directory", file=sys.stderr)
         return 1
 
-    scope: Path | None = None
-    if args.scope is not None:
-        scope = args.scope if args.scope.is_absolute() else (root / args.scope)
-        scope = scope.resolve()
-        if not scope.exists():
-            print(f"error: scope path {scope} does not exist", file=sys.stderr)
-            return 1
-        if not scope.is_relative_to(root):
-            print(f"error: scope path {scope} is not under {root}",
-                  file=sys.stderr)
-            return 1
+    scope, scope_error = _resolve_scope(root, args.scope)
+    if scope_error:
+        print(scope_error, file=sys.stderr)
+        return 1
 
     # Resolve user excludes from `.assess/config.toml` first, then layer the
     # CLI `--exclude` on top. Both extend the built-in defaults; the CLI is
@@ -1345,7 +1474,7 @@ def main() -> int:
     # read-side scans via the same config - see `assess_core.build_run_context`.
     extra_dirs, extra_patterns = resolve_excludes(root, args.exclude)
 
-    excluded_generated: list[dict] = []
+    excluded_generated: list[GeneratedExclusion] = []
     scc_languages: dict[Path, str] = {}
     fn_names: dict[Path, str] = {}
     fn_backends: dict[Path, str] = {}
@@ -1360,15 +1489,7 @@ def main() -> int:
         fn_backends=fn_backends,
     )
     if not files:
-        where = f" under {scope}" if scope is not None else ""
-        # Content excludes can drop every file (an all-generated SDK subtree
-        # under --scope); name them so the dead end explains itself.
-        why = (
-            f" ({len(excluded_generated)} excluded as generated - pass "
-            f"--include-artifacts to score them)"
-            if excluded_generated else ""
-        )
-        print(f"error: no scoreable files found{where}{why}", file=sys.stderr)
+        print(_no_files_message(scope, excluded_generated), file=sys.stderr)
         return 1
 
     _warn_if_dominated_by_one_file(files)
@@ -1391,19 +1512,7 @@ def main() -> int:
         load_survivor_density(args.test_pressure, root)
         if args.test_pressure else {}
     )
-    scope_label = (
-        str(scope.relative_to(root)) if scope is not None and scope != root
-        else None
-    )
-    default_name = (
-        f"hotspot-{root.name}-{scope_label.replace('/', '-')}.svg"
-        if scope_label else f"hotspot-{root.name}.svg"
-    )
-    out = args.out or Path(default_name)
-    title = (
-        f"Hotspot: {root.name}/{scope_label}" if scope_label
-        else f"Hotspot: {root.name}"
-    )
+    out, title = _out_path_and_title(root, scope, args.out)
     render(files, root, out, title,
            show_labels=args.labels, by=effective_by,
            aux_data=aux_data, aux_label=aux_label,

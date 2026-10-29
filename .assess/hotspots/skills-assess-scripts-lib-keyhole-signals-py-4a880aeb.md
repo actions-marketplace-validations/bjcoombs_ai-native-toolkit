@@ -1,28 +1,37 @@
-<!-- assess:run_id=20260919114544-b4104782 artifact_schema_version=1.1.0 -->
+<!-- assess:run_id=20261011125246-0d249381 artifact_schema_version=1.4.0 -->
 # Hotspot: `skills/assess/scripts/lib/keyhole_signals.py`
 
-_First flagged: 2026-06-01. Last seen: 2026-09-19. Status: regressed._
+_First flagged: 2026-06-01. Last seen: 2026-10-11. Status: persistent._
 
 ## Current metrics
 
 | Metric | Value |
 |--------|-------|
-| LOC | 759 |
-| Cyclomatic complexity (file max) | 233.0 |
-| Commits in churn window | 18 |
+| LOC | 860 |
+| Cyclomatic complexity (file aggregate) | 247 |
+| Worst function | `render_findings_markdown` (11) |
+| Commits in churn window | 26 |
 | Has test file | yes |
 
 ## History across runs
 
-| Run date | LOC | CCN | Commits | Status |
-|----------|-----|-----|---------|--------|
-| 2026-09-19 | 759 | 233.0 | 18 | regressed |
+| Run date | Run | LOC | CCN | Commits | Status |
+|----------|-----|-----|-----|---------|--------|
+| 2026-09-19 | - | 759 | 233.0 | 18 | regressed |
+| 2026-10-07 | f520a0c5 | 806 | 249 | 20 | regressed |
+| 2026-10-07 | e950cb1b | 885 | 260 | 22 | regressed |
+| 2026-10-07 | 4ace52ea | 885 | 260 | 22 | persistent |
+| 2026-10-08 | 417634ee | 886 | 260 | 23 | persistent |
+| 2026-10-08 | d0c68d2e | 864 | 247 | 25 | persistent |
+| 2026-10-08 | de900b5c | 860 | 247 | 26 | persistent |
+| 2026-10-08 | 32cb78d4 | 860 | 247 | 26 | persistent |
+| 2026-10-11 | 0d249381 | 860 | 247 | 26 | persistent |
 
 ## Briefing for editing this file
 
 Use this briefing when about to modify `skills/assess/scripts/lib/keyhole_signals.py`:
 
-Hotspot (regressed). 759 LOC, max cyclomatic complexity 233.0, 18 commits in churn window. Carries 5 stale promissory marker(s) (suppression; oldest survived 17 edits to this file). (Briefing refined by LLM via assess_finalize - see Suggested actions below.)
+Hotspot (persistent). 860 LOC, aggregate cyclomatic complexity 247 (worst function `render_findings_markdown` 11), 26 commits in churn window. (Briefing refined by LLM via assess_finalize - see Suggested actions below.)
 
 ## Suggested actions
 

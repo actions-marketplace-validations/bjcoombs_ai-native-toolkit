@@ -8,9 +8,20 @@ dependencies = [
     "grimp>=3.0",
 ]
 
+# Everything the CI jobs in .github/workflows/tests.yml and `make check` run
+# beyond the core deps, pinned by the committed uv.lock beside this file.
+# pyyaml: eight structural guards in tests/test_action_contract.py parse
+# action.yml / assess-gate.yml and pytest.skip without it.
+# This group never reaches Assess Gate consumers: every script the action runs
+# carries a PEP 723 inline block, so uv builds its environment from that block
+# and ignores this project, its groups and uv.lock.
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pyyaml>=6.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
 ]
 
 [tool.pytest.ini_options]
@@ -24,6 +35,18 @@ addopts = "-v --tb=short"
 # import from their own `src/` package which isn't on the path, so collecting
 # them errors. Exclude the whole fixtures tree from collection.
 norecursedirs = ["tests/fixtures"]
+# pytest-cov registers no_cover itself; declaring it here keeps a run without
+# pytest-cov (the plain local `uv run --with pytest pytest`) free of an
+# unknown-marker warning.
+markers = ["no_cover: run this test with coverage tracing paused (pytest-cov)"]
+
+[tool.coverage.report]
+# Layer 6 floor: CI's --cov=scripts run fails below this line rate. Measured
+# 93.44% (9945 statements, 652 missed) on 2026-10-07, identical over three
+# runs; rounded down to 93, a margin of about 44 uncovered lines. A ratchet:
+# raise it when coverage rises, never lower it without a stated reason in the
+# PR that does. Applies to any local run with pytest-cov too.
+fail_under = 93
 
 [tool.ruff]
 target-version = "py311"
@@ -46,30 +69,94 @@ select = ["E4", "E7", "E9", "F", "C901"]
 
 [tool.ruff.lint.mccabe]
 # Per-function cyclomatic complexity. 15 fences current reality: every function
-# already sits at or below it except four genuine offenders (ccn 17-21), which
-# carry an explicit ``# noqa: C901`` with a note - build_doc_graph and
-# authorship_analysis here, render in doc-graph-svg.py, and
+# already sits at or below it except two genuine offenders (ccn 17-19), which
+# carry an explicit ``# noqa: C901`` with a note - authorship_analysis here and
 # build_standalone_skill_zip in scripts/. The gate fails the moment any other
-# function regresses past 15; ratchet down as the four are decomposed.
+# function regresses past 15; ratchet down as the two are decomposed
+# (build_doc_graph was split into phases and render in doc-graph-svg.py into
+# named steps, each retiring its waiver).
 max-complexity = 15
 
 [tool.mypy]
 # Issue #79: type hints existed but were unenforced. This gate makes them a
-# contract. Scoped to the deterministic core (lib/) where the annotations are
-# densest and most load-bearing, plus the orchestrator assess_core.py (the
-# most-churned file, ratcheted in here). The remaining orchestrator scripts
-# (assess_finalize.py, complexity-treemap.py) and the build pipeline are the
-# next ratchet step.
-files = ["scripts/lib", "scripts/assess_core.py"]
-# lib/ is a package; treat scripts/ as the import base so lib.<mod> resolves and
-# the back-compat shims (scripts/stats_diff.py, lib/assess_core.py) don't collide
-# as duplicate top-level modules.
+# contract. It covers every module under scripts/: the deterministic core
+# (lib/), every orchestrator (assess_core, assess_finalize, assess_report,
+# assess_gate, assess_emit_workflow), and the two SVG renderers. Listing the
+# directory rather than each file means a new orchestrator joins the gate by
+# construction instead of waiting for a ratchet step. tests/ is out of scope.
+files = ["scripts"]
+# lib/ is a package; treat scripts/ as the import base so lib.<mod> resolves
+# the same way the orchestrators import it at runtime.
 mypy_path = "scripts"
 explicit_package_bases = true
 namespace_packages = true
-# networkx and grimp ship no type stubs; their absence is not a code defect.
-# The lib modules carry defensive ``# type: ignore[assignment]`` on their
-# degrade-gracefully ``nx = None`` fallbacks so they also type-check when stubs
-# ARE installed; ``warn_unused_ignores`` is left off so those stay put.
+# networkx ships no type stubs; their absence is not a code defect (grimp ships
+# py.typed, so it is checked). The lib modules' degrade-gracefully ``nx = None`` fallbacks carry
+# ``# type: ignore[assignment, unused-ignore]``: without stubs nx is Any and the
+# ignore is unused; with stubs installed the None assignment is a real mismatch.
 ignore_missing_imports = true
-warn_redundant_casts = true
+# Full strict, disallow_any_generics included, with no per-module exception.
+# The flag started off: it flagged 444 bare ``dict`` / ``list`` annotations,
+# almost all on JSON blobs (run-context, stats sidecar, finding rows), and was
+# ratcheted on module by module until every script passed. A known shape is a
+# TypedDict (shared and orchestrator file shapes in ``lib/run_context_types.py``);
+# ``dict[str, Any]`` (``JsonDict``) is for blocks whose keys genuinely vary,
+# such as a run-context read back from disk by a renderer that tolerates older
+# snapshots. strict implies the flag; it is spelled out so the finished state
+# reads at a glance.
+strict = true
+disallow_any_generics = true
+# strict does not reject a bare ``# type: ignore``; this makes the error code
+# mandatory. The trailing ``  # reason`` stays a house convention mypy cannot check.
+enable_error_code = ["ignore-without-code"]
+
+[tool.mutmut]
+# Layer 6 truth-pressure: line coverage shows the tests execute this code,
+# mutation testing shows they would fail if it were wrong. Scoped to six
+# deterministic lib/ modules: three small ones from /assess's own test-focus
+# list, promissory_markers' python_regions helper, and the two largest
+# complexity hotspots (doc_graph, keyhole_signals),
+# about 4.5k mutants as of 2026-10 (the weekly job summary has the live count).
+# Widening the scope is a deliberate ratchet, since a run is O(mutants): keep
+# the weekly run well inside the workflow's 45m budget.
+# Run weekly and on demand by .github/workflows/mutation.yml, never per PR.
+#
+# "src" is a committed relative symlink to scripts/. mutmut 3 names a mutant
+# after its file path with only a leading "src." stripped, so scripts/lib/x.py
+# would be keyed scripts.lib.x while the tests import it as lib.x
+# (pythonpath = scripts) and no mutant would match. Committing the link keeps
+# this config self-contained: CI and the /assess opt-in mutation pass run it as
+# checked out. /assess's walks do not descend the link (treemap entries are
+# keyed by resolved path), so nothing is counted twice. Run locally from
+# skills/assess, then remove mutants/ (gitignored, and skipped by /assess):
+#   uv run --locked --with mutmut==3.8.0 mutmut run
+#   uv run --locked --with mutmut==3.8.0 mutmut results   # survivors
+#   rm -rf mutants
+source_paths = ["src"]
+only_mutate = [
+    "src/lib/stats_diff.py",
+    "src/lib/promissory_markers.py",
+    "src/lib/python_regions.py",
+    "src/lib/doc_staleness.py",
+    "src/lib/doc_graph.py",
+    "src/lib/keyhole_signals.py",
+]
+# Each mutant runs only the tests mutmut's coverage pass maps to it; this list
+# bounds that pass to the suites that own the modules in scope. (tests_dir is
+# deprecated in mutmut 3.8 and appends the whole tests/ tree to this list.)
+pytest_add_cli_args_test_selection = [
+    "tests/test_stats_diff.py",
+    "tests/test_promissory_markers.py",
+    "tests/test_promissory_markers_literals.py",
+    "tests/test_doc_staleness.py",
+    "tests/test_doc_modularity.py",
+    "tests/test_doc_graph.py",
+    "tests/test_keyhole_accretion.py",
+    "tests/test_keyhole_attention.py",
+    "tests/test_keyhole_blocks.py",
+    "tests/test_keyhole_hidden_coupling.py",
+    "tests/test_keyhole_override_contradicts.py",
+    "tests/test_keyhole_render.py",
+    "tests/test_keyhole_suppression.py",
+    "tests/test_keyhole_untrusted_hotspot.py",
+]

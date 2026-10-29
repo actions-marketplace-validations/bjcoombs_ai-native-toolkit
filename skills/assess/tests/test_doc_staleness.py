@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from lib.doc_staleness import LARGE_REPO_CODE_FILES, analyze_doc_staleness
+from lib.doc_staleness import analyze_doc_staleness
 
 
 def _write(root: Path, rel: str, text: str) -> None:
@@ -55,44 +55,61 @@ def test_repo_baseline_when_no_association(tmp_path: Path) -> None:
     assert floating["subject_method"] == "repo-baseline"
 
 
+def test_association_precedence_and_summary_counts(tmp_path: Path) -> None:
+    """Pins the fallback order (nearest-ancestor, parallel docs/ tree, explicit
+    links, repo baseline) and the summary counts derived from it."""
+    # nearest-ancestor wins over a parallel-tree match on the same name.
+    _write(tmp_path, "docs/auth/README.md", "auth")
+    _write(tmp_path, "docs/auth/x.py", "x")
+    _write(tmp_path, "src/auth/a.py", "x")
+    # parallel docs/ tree wins over the doc's explicit links.
+    _write(tmp_path, "docs/billing.md", "billing")
+    _write(tmp_path, "src/billing/b.py", "x")
+    _write(tmp_path, "src/other/o1.py", "x")
+    _write(tmp_path, "src/other/o2.py", "x")
+    # explicit links, then the baseline.
+    _write(tmp_path, "notes.md", "notes")
+    _write(tmp_path, "floating.md", "floating")
+    r = analyze_doc_staleness(
+        tmp_path,
+        doc_to_code_edges=[
+            {"doc": "docs/billing.md", "code": "src/other/o1.py"},
+            {"doc": "docs/billing.md", "code": "src/other/o2.py"},
+            {"doc": "notes.md", "code": "src/other/o1.py"},
+        ],
+    )
+    by_path = {d["path"]: d for d in r["docs"]}
+    assert by_path["docs/auth/README.md"]["subject_method"] == "nearest-ancestor"
+    assert by_path["docs/auth/README.md"]["subject_code_count"] == 1
+    assert by_path["docs/billing.md"]["subject_method"] == "parallel-docs-tree"
+    assert by_path["docs/billing.md"]["subject_code_count"] == 1
+    assert by_path["notes.md"]["subject_method"] == "explicit-links"
+    assert by_path["floating.md"]["subject_method"] == "repo-baseline"
+    assert by_path["floating.md"]["subject_code_count"] == 5
+    assert by_path["floating.md"]["confidence"] == "low"
+    assert by_path["notes.md"]["confidence"] == "high"
+    assert r["association"] == {
+        "code_file_count": 5,
+        "doc_count": 4,
+        "code_under_base_doc": 1,
+        "pct_code_under_base_doc": 0.2,
+        "docs_mapping_to_code": 3,
+        "pct_docs_mapping_to_code": 0.75,
+        "methods": {
+            "nearest-ancestor": 1,
+            "parallel-docs-tree": 1,
+            "explicit-links": 1,
+            "repo-baseline": 1,
+        },
+    }
+
+
 def test_boilerplate_is_not_a_base_doc(tmp_path: Path) -> None:
     _write(tmp_path, "src/LICENSE.md", "MIT")
     _write(tmp_path, "src/x.py", "x")
     r = analyze_doc_staleness(tmp_path)
     # LICENSE must not claim ownership of src/x.py as a base doc
     assert r["association"]["code_under_base_doc"] == 0
-
-
-def test_modularity_large_repo_flag(tmp_path: Path) -> None:
-    for i in range(LARGE_REPO_CODE_FILES + 1):
-        _write(tmp_path, f"mod{i}/f.py", "x")
-    r = analyze_doc_staleness(tmp_path)
-    assert r["modularity"]["large_repo"] is True
-    assert r["modularity"]["base_doc_coverage_when_present"] == 0.0  # no base docs anywhere
-    assert r["modularity"]["base_doc_dir_ratio"] == 0.0
-
-
-def test_base_doc_coverage_is_size_weighted(tmp_path: Path) -> None:
-    """One 30-file service with a base doc should not be drowned by ten
-    1-file utility dirs without one. Size-weighting reflects what an agent
-    actually needs to navigate; the un-weighted dir ratio is reported alongside
-    for transparency.
-    """
-    # A large module (30 files) with a base doc...
-    _write(tmp_path, "services/payments/README.md", "payments")
-    for i in range(30):
-        _write(tmp_path, f"services/payments/f{i}.py", "x")
-    # ...and ten utility/leaf dirs (1 file each) with no doc.
-    for i in range(10):
-        _write(tmp_path, f"internal/util{i}/u.py", "x")
-
-    r = analyze_doc_staleness(tmp_path)
-    # Un-weighted dir ratio is low (1 doc'd dir out of 11), but the size-weighted
-    # coverage reflects that ~75% of code sits under a maintained base doc.
-    assert r["modularity"]["base_doc_dir_ratio"] < 0.2
-    assert r["modularity"]["base_doc_coverage_when_present"] >= 0.7
-    # Sanity: the when-present number matches what the association block reports.
-    assert r["modularity"]["base_doc_coverage_when_present"] == r["association"]["pct_code_under_base_doc"]
 
 
 def test_no_git_degrades_to_zero_churn(tmp_path: Path) -> None:
@@ -432,11 +449,11 @@ def test_no_git_reports_no_bulk_commits(tmp_path: Path) -> None:
 
 def test_instruction_freshness_skips_bulk_commit(git_repo) -> None:
     """The instruction grader's clock shares the bulk-commit skip."""
-    from assess_core import _grade_instruction_files
+    from lib.instruction_files import grade_instruction_files
 
     repo, commit = git_repo
     _bulk_fixture(repo, commit)
-    files = _grade_instruction_files(repo)[0]
+    files = grade_instruction_files(repo)[0]
     assert files["CLAUDE.md"]["freshness_days"] in (299, 300)  # DST slack
 
 
@@ -539,7 +556,7 @@ def test_shallow_clone_marks_scan_incomplete(git_repo, tmp_path: Path) -> None:
 def test_non_doc_instruction_file_skips_bulk_commit(git_repo) -> None:
     """`.cursorrules` is outside the docs' pathspec; the per-file route applies
     the same bulk skip."""
-    from assess_core import _grade_instruction_files
+    from lib.instruction_files import grade_instruction_files
 
     repo, commit = git_repo
     _write(repo, ".cursorrules", "Prefer small functions.\n")
@@ -551,7 +568,7 @@ def test_non_doc_instruction_file_skips_bulk_commit(git_repo) -> None:
         p = repo / rel
         p.write_text("<!-- again -->\n" + p.read_text(), encoding="utf-8")
     commit("chore: headers everywhere", days_ago=5)
-    files = _grade_instruction_files(repo)[0]
+    files = grade_instruction_files(repo)[0]
     assert files[".cursorrules"]["freshness_days"] in (399, 400)  # DST slack
 
 
@@ -597,3 +614,201 @@ def test_rename_scan_failure_marks_scan_incomplete(git_repo, monkeypatch) -> Non
     assert r["bulk_commit_scan_complete"] is False
     days = {d["path"]: d["last_commit_days"] for d in r["docs"]}
     assert days["docs/caching.md"] == 3
+
+
+# --- Behind-the-subject cap: a lying map must be behind its subject now -----
+
+def _lying_map_paths(staleness: dict, repo: Path) -> list[str]:
+    """Run the doc->complexity join with `app.py` over the high-CCN bar."""
+    from lib.doc_complexity_join import analyze_doc_complexity_join
+
+    stats = {"ccn": {"p95": 10.0}, "top_complex": [{"path": "app.py", "ccn": 30.0}]}
+    joined = analyze_doc_complexity_join(stats, staleness, repo)
+    return [u["path"] for u in joined["findings"]["lying_maps"]]
+
+
+def _churn_then_fix(repo: Path, commit) -> None:
+    """Doc frozen for months beside heavy churn, then corrected."""
+    (repo / "README.md").write_text("module map", encoding="utf-8")
+    (repo / "app.py").write_text("v = 0", encoding="utf-8")
+    commit("initial docs+code", days_ago=200)
+    for i in range(12):
+        (repo / "app.py").write_text(f"v = {i + 1}", encoding="utf-8")
+        commit(f"change {i}", days_ago=100 - i * 5)
+    (repo / "README.md").write_text("module map, corrected", encoding="utf-8")
+    commit("docs: correct the module map", days_ago=6)
+
+
+def test_doc_edited_after_subject_churn_is_not_flagged(git_repo) -> None:
+    """A doc corrected after its subject's last change is current, however
+    busy the subject was across the window: ratio 0, no lying_map."""
+    repo, commit = git_repo
+    _churn_then_fix(repo, commit)
+
+    r = analyze_doc_staleness(repo)
+    readme = next(d for d in r["docs"] if d["path"] == "README.md")
+    assert readme["window_ratio"] >= 5  # the old whole-window signal still fires
+    assert readme["code_churn_since_doc_change"] == 0
+    assert readme["ratio"] == 0.0
+    assert _lying_map_paths(r, repo) == []
+
+
+def test_doc_older_than_heavy_churn_is_flagged(git_repo) -> None:
+    repo, commit = git_repo
+    (repo / "README.md").write_text("module map", encoding="utf-8")
+    (repo / "app.py").write_text("v = 0", encoding="utf-8")
+    commit("initial docs+code", days_ago=200)
+    for i in range(6):
+        (repo / "app.py").write_text(f"v = {i + 1}", encoding="utf-8")
+        commit(f"change {i}", days_ago=50 - i * 5)
+
+    r = analyze_doc_staleness(repo)
+    readme = next(d for d in r["docs"] if d["path"] == "README.md")
+    assert readme["code_churn_since_doc_change"] == 6
+    assert readme["ratio"] >= 4
+    assert _lying_map_paths(r, repo) == ["README.md"]
+
+
+def test_doc_fixed_then_outrun_again_is_flagged(git_repo) -> None:
+    """The fix resets the clock, not the verdict: heavy churn after the
+    correction makes the doc a lying map again."""
+    repo, commit = git_repo
+    _churn_then_fix(repo, commit)
+    for i in range(5):
+        (repo / "app.py").write_text(f"w = {i}", encoding="utf-8")
+        commit(f"post-fix change {i}", days_ago=5 - i)
+
+    r = analyze_doc_staleness(repo)
+    readme = next(d for d in r["docs"] if d["path"] == "README.md")
+    assert readme["code_churn_since_doc_change"] == 5
+    assert readme["ratio"] >= 4
+    assert _lying_map_paths(r, repo) == ["README.md"]
+
+
+def test_doc_and_code_changed_together_is_current(git_repo) -> None:
+    """The commit that changes the doc and its code together does not count
+    as churn after the doc."""
+    repo, commit = git_repo
+    (repo / "README.md").write_text("module map", encoding="utf-8")
+    (repo / "app.py").write_text("v = 0", encoding="utf-8")
+    commit("initial docs+code", days_ago=200)
+    for i in range(6):
+        (repo / "app.py").write_text(f"v = {i + 1}", encoding="utf-8")
+        commit(f"change {i}", days_ago=50 - i * 5)
+    (repo / "README.md").write_text("module map v2", encoding="utf-8")
+    (repo / "app.py").write_text("v = 99", encoding="utf-8")
+    commit("feat: change app and its doc", days_ago=1)
+
+    r = analyze_doc_staleness(repo)
+    readme = next(d for d in r["docs"] if d["path"] == "README.md")
+    assert readme["code_churn_since_doc_change"] == 0
+    assert readme["ratio"] == 0.0
+
+
+def test_generated_doc_provenance_unaffected_by_cap(git_repo) -> None:
+    """Provenance still decides a generated doc: source newer -> lying_map,
+    even though the doc's own subject churn since it changed is zero."""
+    repo, commit = git_repo
+    (repo / "data").mkdir()
+    (repo / "data" / "jira.tsv").write_text("rows v1", encoding="utf-8")
+    (repo / "README.md").write_text(
+        "---\nsource: data/jira.tsv\n---\nnotes", encoding="utf-8",
+    )
+    (repo / "app.py").write_text("v = 0", encoding="utf-8")
+    commit("generate", days_ago=10)
+    (repo / "data" / "jira.tsv").write_text("rows v2", encoding="utf-8")
+    commit("source moved on", days_ago=1)
+
+    r = analyze_doc_staleness(repo)
+    readme = next(d for d in r["docs"] if d["path"] == "README.md")
+    assert readme["provenance"]["source_newer"] is True
+    assert readme["code_churn_since_doc_change"] == 0
+    assert _lying_map_paths(r, repo) == ["README.md"]
+
+
+def test_failed_commit_read_falls_back_to_window_ratio(git_repo, monkeypatch) -> None:
+    """Honest degrade: when the per-commit read fails, the cap is not applied
+    and the doc reports the uncapped window ratio with no since-doc count."""
+    import lib.doc_staleness as ds
+
+    repo, commit = git_repo
+    _churn_then_fix(repo, commit)
+    monkeypatch.setattr(ds, "commit_epochs_by_file", lambda *_a, **_k: None)
+
+    r = analyze_doc_staleness(repo)
+    readme = next(d for d in r["docs"] if d["path"] == "README.md")
+    assert readme["code_churn_since_doc_change"] is None
+    assert readme["ratio"] == readme["window_ratio"] >= 5
+
+
+def test_window_since_maps_every_churn_window_label() -> None:
+    """The cap reads the same window `pick_churn_window` chose; an unmatched
+    label would silently widen it to full history."""
+    from lib.doc_staleness import _window_since
+    from lib.git_churn import CHURN_WINDOWS
+
+    for label, since in CHURN_WINDOWS:
+        assert _window_since(f"commits ({label})") == since
+    assert _window_since(None) is None
+
+
+def test_repo_baseline_doc_is_capped_by_repo_wide_churn(git_repo) -> None:
+    """A floating doc (no derivable subject) measures churn after it against
+    every code file."""
+    repo, commit = git_repo
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "app.py").write_text("v = 0", encoding="utf-8")
+    (repo / "notes").mkdir()
+    (repo / "notes" / "design.md").write_text("design", encoding="utf-8")
+    commit("initial", days_ago=200)
+    for i in range(4):
+        (repo / "pkg" / "app.py").write_text(f"v = {i + 1}", encoding="utf-8")
+        commit(f"change {i}", days_ago=100 - i * 5)
+    (repo / "notes" / "design.md").write_text("design v2", encoding="utf-8")
+    commit("docs: refresh design", days_ago=50)
+    (repo / "pkg" / "app.py").write_text("v = 9", encoding="utf-8")
+    commit("after doc", days_ago=10)
+
+    r = analyze_doc_staleness(repo)
+    design = next(d for d in r["docs"] if d["path"] == "notes/design.md")
+    assert design["subject_method"] == "repo-baseline"
+    assert design["subject_code_count"] == 1
+    assert design["code_churn_since_doc_change"] == 1
+    assert design["ratio"] == 1.0
+
+
+def test_one_multi_file_commit_after_fix_counts_once(git_repo) -> None:
+    """The cap counts distinct commits: one follow-up commit touching three
+    subject files after a doc fix is one commit behind, not a lying map."""
+    repo, commit = git_repo
+    _churn_then_fix(repo, commit)
+    for name in ("app.py", "util.py", "cli.py"):
+        (repo / name).write_text(f"# follow-up {name}", encoding="utf-8")
+    commit("feat: one follow-up across three files", days_ago=2)
+
+    r = analyze_doc_staleness(repo)
+    readme = next(d for d in r["docs"] if d["path"] == "README.md")
+    assert readme["code_churn_since_doc_change"] == 1
+    assert readme["ratio"] == 1.0
+    assert _lying_map_paths(r, repo) == []
+
+
+def test_doc_frozen_before_window_keeps_file_commit_ratio(git_repo) -> None:
+    """A doc never touched inside the window is behind by all of it, so the
+    cap does not swap in the distinct-commit count: three wide refactors keep
+    their full file-commit weight and still flag the doc."""
+    repo, commit = git_repo
+    (repo / "README.md").write_text("module map", encoding="utf-8")
+    for i in range(10):
+        (repo / f"m{i}.py").write_text("v = 0", encoding="utf-8")
+    commit("initial", days_ago=500)
+    for j in range(3):
+        for i in range(10):
+            (repo / f"m{i}.py").write_text(f"v = {j + 1}", encoding="utf-8")
+        commit(f"refactor {j}", days_ago=40 - j * 10)
+
+    r = analyze_doc_staleness(repo)
+    assert r["churn_window"] == "commits (last 12mo)"
+    readme = next(d for d in r["docs"] if d["path"] == "README.md")
+    assert readme["code_churn_since_doc_change"] == 3
+    assert readme["ratio"] == readme["window_ratio"] == 30.0

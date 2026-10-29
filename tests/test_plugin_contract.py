@@ -1,18 +1,26 @@
-"""Deterministic contract + reference checks for the plugin's skills and commands.
+"""Deterministic contract + reference checks for the plugin's skills and agents.
 
 No AI, no network. Encodes the invariants documented in CLAUDE.md as executable
 assertions so a broken reference or dropped frontmatter fails the PR.
 """
+import ast
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
+import yaml  # required: the plugin contract job installs pyyaml
 
 REPO = Path(__file__).resolve().parent.parent
 SKILLS = REPO / "skills"
-COMMANDS = REPO / "commands"
+LEGACY_COMMANDS = REPO / "commands"
 AGENTS = REPO / "agents"
+# Acceptance-contract gates and canary harness: stdlib-only by contract.
+GATE_CODE_DIRS = (REPO / "scripts" / "contract", REPO / "scripts" / "canaries")
+GATE_CODE_FILES = sorted(
+    p for d in GATE_CODE_DIRS if d.is_dir() for p in d.glob("*.py")
+)
 PLUGIN = REPO / ".claude-plugin"
 
 # Skills referenced by name that live outside this plugin (superpowers, etc.).
@@ -24,8 +32,15 @@ EXTERNAL_SKILLS = {
 BUILTIN_AGENTS = {"general-purpose", "Explore", "Plan", "statusline-setup"}
 
 PLACEHOLDER_RE = re.compile(r"\b(TODO|TBD|FIXME)\b")
-# No trailing \b: bash reads $1x and $10 as $1 followed by text.
-BARE_POSITIONAL_RE = re.compile(r"\$[1-9]")
+# Claude Code's positional placeholders are 0-based ($0 is the first argument),
+# so $0 is guarded too; that also catches shell's $0 (the script name), which
+# substitution corrupts the same way. No trailing \b: bash reads $1x and $10 as
+# $1 followed by text.
+BARE_POSITIONAL_RE = re.compile(r"\$[0-9]")
+# The agent `color` values Claude Code documents; any other value is ignored
+# without an error, so the agent silently gets no colour.
+# https://code.claude.com/docs/en/sub-agents.md
+AGENT_COLORS = {"red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"}
 # Any indent: substitution ignores markdown structure, so a fence nested in a
 # list item is corrupted the same way.
 FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
@@ -49,9 +64,10 @@ ENVELOPE_TAG_RE = re.compile(
 # markers are 7+ identical chars at line start; the angle/pipe forms are
 # unambiguous (a `=======` separator collides with markdown setext headings, and
 # is always bracketed by the angle markers anyway, so we don't need it).
-# Regression guard for #211/#216, where commands/tm.md shipped on main for ~3
-# weeks with three unresolved conflict regions (535 stale lines). Reference a
-# marker illustratively as inline code (`` `<<<<<<<` ``) so it never starts a line.
+# Regression guard for #211/#216, where commands/tm.md (now
+# skills/tm/SKILL.md) shipped on main for ~3 weeks with three unresolved
+# conflict regions (535 stale lines). Reference a marker illustratively as
+# inline code (`` `<<<<<<<` ``) so it never starts a line.
 CONFLICT_MARKER_RE = re.compile(r"(?:<{7,}|>{7,}|\|{7,})(?: |$)")
 # A quoted jq program on one line, and inside it a read of the *whole*
 # doc_graph block: `.doc_graph` not followed by a field (`.doc_graph.orphans` is
@@ -108,20 +124,16 @@ def skill_dirs():
     return [p.parent for p in skill_md_files()]
 
 
-def command_files():
-    return sorted(COMMANDS.glob("*.md")) if COMMANDS.is_dir() else []
-
-
 def shipped_md():
     # references/*.md is left out on purpose: a skill opens those by path, so
     # Claude Code never argument-substitutes them and a bare $1 there is safe.
-    return skill_md_files() + command_files()
+    return skill_md_files()
 
 
 def all_authored_markdown():
     """Every authored markdown file that ships with the plugin.
 
-    Broader than ``shipped_md()`` (SKILL.md + commands) because leaked envelope
+    Broader than ``shipped_md()`` (every SKILL.md) because leaked envelope
     tags can land in docs/ and module README.md files too - that's exactly where
     the v1.24.0 escape happened. Excludes test fixtures (intentional inputs) and
     build/VCS dirs.
@@ -136,8 +148,9 @@ def known_skill_names():
 
 
 def known_agent_names():
-    names = {p.stem for p in AGENTS.glob("*.md")} if AGENTS.is_dir() else set()
-    return names | BUILTIN_AGENTS
+    # Same walk as agent_files(), so the frontmatter contract and the
+    # subagent_type reference check agree on what counts as an agent.
+    return {p.stem for p in agent_files()} | BUILTIN_AGENTS
 
 
 @pytest.mark.parametrize("d", skill_dirs(), ids=lambda d: d.name)
@@ -148,10 +161,122 @@ def test_skill_frontmatter(d):
     assert _fm_scalar(fm, "description"), f"{d.name}: non-empty description required"
 
 
+def agent_files():
+    # Every .md under agents/ is an agent definition: Claude Code registers each
+    # one as an agent, so none is exempt (a README there loaded as a bogus
+    # `ai-native-toolkit:README` agent until it moved to docs/index.md). The walk
+    # is recursive as a precaution: holding a nested doc to the agent contract is
+    # strict but harmless.
+    if not AGENTS.is_dir():
+        return []
+    return sorted(AGENTS.rglob("*.md"))
+
+
+def test_every_agents_md_is_an_agent():
+    # A stray doc under agents/ (a README, notes) has no frontmatter `name` and
+    # would load as a bogus agent; catalog agents in docs/index.md instead.
+    strays = []
+    for p in agent_files():
+        fm, _ = _split_frontmatter(p)
+        if fm is None or not _fm_scalar(fm, "name"):
+            strays.append(str(p.relative_to(REPO)))
+    assert not strays, (
+        "every .md under agents/ loads as an agent and needs frontmatter with "
+        f"`name`; move docs out of agents/ (catalog lives in docs/index.md): {strays}"
+    )
+
+
+@pytest.mark.parametrize("p", agent_files(), ids=lambda p: p.stem)
+def test_agent_frontmatter(p):
+    fm, _ = _split_frontmatter(p)
+    assert fm is not None, f"{p.name}: missing YAML frontmatter"
+    assert _fm_scalar(fm, "name") == p.stem, f"{p.name}: name: must match filename"
+    assert _fm_scalar(fm, "description"), f"{p.name}: non-empty description required"
+    assert _fm_scalar(fm, "model"), f"{p.name}: non-empty model required"
+    color = _fm_scalar(fm, "color")
+    assert color in AGENT_COLORS, (
+        f"{p.name}: color {color!r} is not a documented Claude Code agent colour "
+        f"({', '.join(sorted(AGENT_COLORS))}); an unknown value is ignored silently"
+    )
+
+
+def _manual_only(fm: str) -> bool:
+    return (_fm_scalar(fm, "disable-model-invocation") or "").lower() == "true"
+
+
 @pytest.mark.parametrize("d", skill_dirs(), ids=lambda d: d.name)
 def test_skill_has_trigger_clause(d):
+    # The router matches a description's TRIGGER clause to auto-load a skill.
+    # A skill with disable-model-invocation: true is never auto-loaded, so a
+    # TRIGGER clause there would describe behaviour that cannot happen; it must
+    # not carry one. Every other skill must.
     fm, _ = _split_frontmatter(d / "SKILL.md")
-    assert fm and "TRIGGER" in fm, f"{d.name}: description must include a TRIGGER clause"
+    assert fm is not None, f"{d.name}/SKILL.md missing YAML frontmatter"
+    if _manual_only(fm):
+        assert "TRIGGER" not in fm, (
+            f"{d.name}: disable-model-invocation: true skills are slash-command "
+            f"only, so a TRIGGER clause misdescribes them"
+        )
+    else:
+        assert "TRIGGER" in fm, f"{d.name}: description must include a TRIGGER clause"
+
+
+@pytest.mark.parametrize("d", skill_dirs(), ids=lambda d: d.name)
+def test_skill_frontmatter_is_valid_yaml(d):
+    # The regex checks above read one key at a time and pass on frontmatter
+    # that no YAML parser accepts, such as an unquoted argument-hint opening
+    # with "[" (a flow sequence) followed by more text.
+    fm, _ = _split_frontmatter(d / "SKILL.md")
+    assert fm is not None, f"{d.name}/SKILL.md missing YAML frontmatter"
+    try:
+        data = yaml.safe_load(fm)
+    except yaml.YAMLError as exc:
+        pytest.fail(f"{d.name}/SKILL.md frontmatter is not valid YAML: {exc}")
+    assert isinstance(data, dict), f"{d.name}/SKILL.md frontmatter is not a mapping"
+
+
+def _imported_roots(path: Path) -> set[str]:
+    """Root package of every import in ``path``, nested ones included.
+
+    ``ast.walk`` on purpose, not ``tree.body``: a lazy import inside a function
+    is still a dependency the gate cannot run without.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    return names
+
+
+@pytest.mark.parametrize("p", GATE_CODE_FILES, ids=lambda p: str(p.relative_to(REPO)))
+def test_gate_code_is_stdlib_only(p: Path) -> None:
+    # The gates and the canary harness run under a bare `uv run python`, so
+    # they may import only the standard library and each other's flat modules
+    # (the harness imports the gates by path). This job installs pyyaml for the
+    # frontmatter check above, so a stray `import yaml` here would no longer
+    # fail on a missing module; this test keeps the gates dependency-free.
+    allowed = (
+        set(sys.stdlib_module_names)
+        | {q.stem for q in GATE_CODE_FILES}
+        | {"__future__"}
+    )
+    foreign = sorted(_imported_roots(p) - allowed)
+    assert not foreign, (
+        f"{p.relative_to(REPO)} imports {foreign}; gate code is stdlib-only"
+    )
+
+
+def test_no_legacy_command_files():
+    # commands/ is the older plugin layout; slash-command workflows live at
+    # skills/<name>/SKILL.md with disable-model-invocation: true (#500).
+    found = sorted(LEGACY_COMMANDS.glob("*.md")) if LEGACY_COMMANDS.is_dir() else []
+    assert not found, (
+        "commands/ is the legacy layout; move each file to skills/<name>/SKILL.md "
+        f"with disable-model-invocation: true: {[p.name for p in found]}"
+    )
 
 
 def _fence_spans(lines):
@@ -210,14 +335,15 @@ def test_unclosed_fence_leaves_the_tail_in_scope():
 
 @pytest.mark.parametrize("p", shipped_md(), ids=lambda p: str(p.relative_to(REPO)))
 def test_no_bare_positional_in_skill_md(p):
-    # Claude Code substitutes the invocation's arguments into bare $1..$9
-    # anywhere in a SKILL.md before the model reads it, fenced or not, so a
-    # shell function or awk field reference runs with argument words in place
-    # of its parameters. Brace form (${1}) and awk's $(1) are left alone.
-    # Commands are exempt: there $1..$9 is the documented per-argument
-    # placeholder, used on purpose.
-    if p.name != "SKILL.md":
-        pytest.skip("commands use $1..$9 as intended argument placeholders")
+    # Claude Code substitutes the invocation's arguments into bare $0..$9
+    # anywhere in a SKILL.md before the model reads it, fenced or not; the
+    # placeholders are 0-based, so $0 is the first argument and $1 the second
+    # (https://code.claude.com/docs/en/skills.md, "String substitutions"). A
+    # shell function, a shell $0, or an awk field reference therefore runs with
+    # argument words in place of its parameters. Brace form (${0}) and awk's
+    # $(0) are left alone. Named placeholders ($name) need no guard: they exist
+    # only for skills that declare an `arguments` frontmatter list, and none
+    # here does.
     for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
         m = BARE_POSITIONAL_RE.search(line)
         assert not m, (
@@ -315,12 +441,12 @@ def test_subagent_types_resolve(p):
 def test_subagent_types_has_cases():
     """Parametrizing over an empty list is a silently green test.
 
-    The subagent check ran over ``commands/*.md`` alone before; a discovery
+    The subagent check once ran over the legacy ``commands/*.md`` alone; a discovery
     change that returns nothing would make it pass by collecting no cases at
     all. Pin the floor so the regression is red instead of invisible.
     """
     found = shipped_md()
-    assert len(found) >= 20, f"expected >= 20 shipped markdown components, found {len(found)}"
+    assert len(found) >= 19, f"expected >= 19 shipped markdown components, found {len(found)}"
 
 
 def _unnarrowed_doc_graph_reads(text: str) -> list[str]:

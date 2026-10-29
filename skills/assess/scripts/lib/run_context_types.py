@@ -1,0 +1,735 @@
+"""TypedDict shapes for the run-context.json rows the lib modules build.
+
+A shape lives here when a second ``lib/`` module builds or reads it (a broken
+doc link, a doc-to-code edge, a dead-code candidate, a bulk commit, a co-change
+pair, a keyhole block that ``context_blocks`` copies into the run-context), or
+when it belongs to the same run-context block as one that does: the
+``doc_graph``, ``dead_code`` and keyhole blocks keep every row shape together
+here, so a block is read in one place. The orchestrators' file shapes (the
+stats sidecar ``complexity-treemap.py`` writes, the ``finalize-input.json``
+``assess_finalize`` reads) also live here, which keeps those scripts under their
+file-size ceilings. Any other shape stays in the module that builds it. Typing
+them turns the shape from a docstring comment into a contract mypy checks at
+every construction site.
+
+These are annotations only. A TypedDict is a plain ``dict`` at runtime, so the
+serialised run-context is byte-identical to the untyped version.
+
+mypy runs with ``disallow_any_generics`` on for every script (``[tool.mypy]`` in
+``pyproject.toml``), so a bare ``dict`` fails the gate: a known shape belongs
+here or beside its builder, and ``JsonDict`` names a block whose keys vary.
+"""
+from __future__ import annotations
+
+from typing import Any, Literal, NotRequired, TypedDict
+
+# A run-context block read back from JSON (or about to be written to it) whose
+# keys vary with the run: config sections, another module's block consumed
+# with ``.get``. ``dict[str, Any]`` names the dynamism instead of hiding it in
+# a bare ``dict``.
+JsonDict = dict[str, Any]
+
+
+# --- liveness_scan: the dead_code block -----------------------------------
+
+class DeadCodeCandidate(TypedDict):
+    """One symbol a dead-code tool reports unused."""
+
+    path: str
+    line: int
+    kind: str
+    # knip reports an export as a name or an object; the object's ``name`` is
+    # taken when present, otherwise the raw value passes through.
+    symbol: Any
+
+
+class DeadCodeTool(TypedDict):
+    """One per-language tool status row in ``dead_code.tools``."""
+
+    language: str
+    # Dart's entry carries the capability's ``candidate_tool``, read with
+    # ``.get`` from a JSON-shaped block, so it may be absent (None).
+    tool: str | None
+    status: str
+    reason: str | None
+    # Only the JVM ``offer`` row records the consent gate it waits on.
+    consent: NotRequired[Any]
+
+
+class DeadCodeBlock(TypedDict):
+    """``run-context.json`` ``liveness.dead_code``."""
+
+    available: bool
+    candidate_count: int
+    # Maven liveness folds its unused-declared-dependency rows in here with the
+    # same shape (``path`` is the pom, ``symbol`` the coordinate).
+    candidates: list[DeadCodeCandidate]
+    tools: list[DeadCodeTool]
+    caveat: str
+
+
+# --- doc_links / doc_graph: doc-graph rows ---------------------------------
+
+# ``from`` is a keyword, so the shapes that carry it use the functional form.
+BrokenLink = TypedDict("BrokenLink", {"from": str, "target": str, "kind": str})
+MissingXref = TypedDict("MissingXref", {"from": str, "to": str})
+
+
+class DocToCodeEdge(TypedDict):
+    doc: str
+    code: str
+
+
+class DocHub(TypedDict):
+    path: str
+    pagerank: float
+    out_degree: int
+    in_degree: int
+
+
+class DeclaredMoc(TypedDict):
+    path: str
+    out_degree: int
+    is_structural_hub: bool
+
+
+class LinkParent(TypedDict):
+    path: str
+    link_parent: str | None
+    link_entry: str | None
+
+
+class DirectoryBreakdownRow(TypedDict):
+    path: str
+    doc_count: int
+    unreachable_count: int
+    broken_link_count: int
+
+
+class ExcludedTree(TypedDict):
+    """An excluded raw-source or working-notes tree as the doc graph reports it."""
+
+    path: str
+    file_count: int
+
+
+class SourceTree(TypedDict):
+    """A detected raw-source or working-notes tree with the docs it removes."""
+
+    path: str
+    file_count: int
+    docs: list[str]
+
+
+class DocSignal(TypedDict, total=False):
+    """Per-doc graph signals the raw-source and working-notes classifiers read.
+
+    The raw pass fills the degrees and ``machine_links``; the working-notes
+    pass fills ``in_degree`` and ``inbound_sources``.
+    """
+
+    in_degree: int
+    out_degree: int
+    machine_links: int
+    inbound_sources: list[str]
+
+
+class DocGraphBlock(TypedDict):
+    """``run-context.json`` ``doc_graph``: :meth:`lib.doc_graph.DocGraphResult.as_dict`."""
+
+    available: bool
+    reason: str
+    doc_count: int
+    edge_count: int
+    hubs: list[DocHub]
+    orphans: list[str]
+    orphan_rate: float
+    island_count: int
+    reachability_pct: float
+    entry_points: list[str]
+    unreachable: list[str]
+    declared_mocs: list[DeclaredMoc]
+    moc_named_but_not_wired: list[str]
+    doc_to_code_edges: list[DocToCodeEdge]
+    dangling_links: int
+    broken_links: list[BrokenLink]
+    missing_xrefs: list[MissingXref]
+    ambiguous_wikilinks: int
+    vault_detected: bool
+    obsidiantools_available: bool
+    excluded_raw_trees: list[ExcludedTree]
+    raw_source_doc_count: int
+    curated_doc_count: int
+    raw_source_orphan_rate: float
+    raw_source_broken_links: int
+    excluded_working_notes_trees: list[ExcludedTree]
+    working_notes_doc_count: int
+    working_notes_orphan_rate: float
+    working_notes_broken_links: int
+    link_only_orphan_rate: float
+    link_only_reachability_pct: float
+    directory_breakdown: list[DirectoryBreakdownRow]
+    directory_count: int
+    link_parents: list[LinkParent]
+
+
+# --- git_churn / doc_staleness ---------------------------------------------
+
+class BulkCommit(TypedDict):
+    """A bulk mechanical commit the content clock skipped."""
+
+    sha: str
+    date: str
+    docs_touched: int
+    doc_count: int
+
+
+# --- test_pressure: the Layer-1 write-side block ---------------------------
+#
+# Built by the ``test_pressure`` package (``aggregate``, ``mutation``,
+# ``mutmut3``, ``heuristics``) and read by ``mutation_cap``,
+# ``untrusted_hotspot`` and ``keyhole_signals``, so the whole block lives here.
+
+class MutationFileResult(TypedDict):
+    """One file's mutation figures, the row of ``test_pressure.per_file``."""
+
+    file: str
+    # The mutmut 2 survivor-only listing cannot see killed mutants, so killed
+    # and total are None there; every other parser counts them.
+    killed: int | None
+    survived: int
+    total: int | None
+
+
+class SurvivorDensity(TypedDict):
+    """``test_pressure.survivor_density``."""
+
+    overall: float | None
+    total_survived: int
+    total_mutants: int | None
+    by_file: dict[str, int]
+
+
+class SurvivorCluster(TypedDict):
+    """A file whose survivor count clears the cluster threshold."""
+
+    file: str
+    survived: int
+
+
+class MutationGroupRecord(TypedDict):
+    """A mutmut 3 package run before ``mutation_run`` is decided.
+
+    The optional keys are filled as the run reaches them, so a record spreads
+    into a finished :class:`MutationGroup` without dropping any of them.
+    """
+
+    root: str
+    # "repo" (the package's own config) or "generated".
+    config: str
+    scope: list[str]
+    # "venv", "uv" or "path"; absent when the run stopped before resolving it.
+    runner: NotRequired[str]
+    # Focus files the run produced no figures for.
+    unmeasured: NotRequired[list[str]]
+    reason: NotRequired[str]
+    # Present (True) only on a run stopped at the budget with saved verdicts.
+    partial: NotRequired[bool]
+
+
+class MutationGroup(MutationGroupRecord):
+    """One entry of ``test_pressure.mutation_groups``."""
+
+    mutation_run: bool
+
+
+class MutationConfig(TypedDict):
+    """``detect_mutation_config``: mutation-testing setup the repo carries."""
+
+    present: bool
+    tools: list[str]
+    ci_integrated: bool
+
+
+class MutationRunResult(TypedDict):
+    """``run_bounded_mutation``: the mutation tier's result before aggregation.
+
+    Keys beyond the first two appear only on the paths that reach them; the
+    mutmut 3 pass adds ``groups``.
+    """
+
+    mutation_run: bool
+    available: bool
+    tool: NotRequired[str]
+    scope: NotRequired[list[str]]
+    per_file: NotRequired[list[MutationFileResult]]
+    reason: NotRequired[str]
+    groups: NotRequired[list[MutationGroup]]
+
+
+class AssertionOnInternalFinding(TypedDict):
+    test_file: str
+    subject_function: str
+    internal_field: str
+    confidence: str
+
+
+class UntestedBoundaryFinding(TypedDict):
+    file: str
+    line: int
+    operator: str
+    covered: bool
+    boundary_tested: bool
+
+
+class DuplicateTruthFinding(TypedDict):
+    file: str
+    field_name: str
+    derives_from: str
+    confidence: str
+
+
+class CheapHeuristics(TypedDict):
+    """``test_pressure.cheap_heuristics``."""
+
+    assertion_on_internal: list[AssertionOnInternalFinding]
+    untested_boundaries: list[UntestedBoundaryFinding]
+    duplicate_truth: list[DuplicateTruthFinding]
+    # The unavailable marker (``mutation_cap.normalize_test_pressure``)
+    # carries the three buckets only.
+    confidence_note: NotRequired[str]
+
+
+class TestPressureBlock(TypedDict):
+    """``run-context.json`` ``test_pressure`` from a scan that ran."""
+
+    mutation_config_present: bool
+    mutation_tools_detected: list[str]
+    ci_integrated: bool
+    mutation_run: bool
+    mutation_scope: list[str]
+    per_file: list[MutationFileResult]
+    survivor_density: SurvivorDensity
+    survivor_clusters: list[SurvivorCluster]
+    gap_signal: str
+    cheap_heuristics: CheapHeuristics
+    # Why the mutation pass did not run, when it did not.
+    mutation_note: NotRequired[str]
+    # One record per package root the mutmut 3 pass ran.
+    mutation_groups: NotRequired[list[MutationGroup]]
+
+
+class TestPressureUnavailable(TypedDict):
+    """``test_pressure`` when the scan failed: "not assessed", never a negative."""
+
+    available: Literal[False]
+    # Whatever the failed scan reported, or a fixed message.
+    reason: object
+    mutation_config_present: None
+    cheap_heuristics: CheapHeuristics
+
+
+# --- change_coupling / coupling_analysis: the behaviour block rows ---------
+
+class CoChangePair(TypedDict):
+    """B1: two files that changed together in ``co_change_count`` commits."""
+
+    file_a: str
+    file_b: str
+    co_change_count: int
+    support_pct: float
+
+
+class CouplingRow(TypedDict):
+    """One B3 row from ``coupling_analysis``: a disagreement or a refactor boundary."""
+
+    path: str
+    containment_ratio: float
+    # ``hidden_coupling``, ``bleeding_module``, ``refactor_boundary``, or None
+    # for a directory evaluated and consciously left alone.
+    finding: str | None
+    recommendation: str
+    # ``keyhole_signals`` writes these onto the hidden-coupling rows only.
+    coupled_pairs: NotRequired[list[CoChangePair]]
+    coupled_pairs_total: NotRequired[int]
+
+
+# --- keyhole_signals: the cross-layer blocks and derived findings ----------
+
+class BehaviourFields(TypedDict):
+    """The behaviour block's data keys, present on every path."""
+
+    containment_by_dir: dict[str, float]
+    change_coupling_pairs: list[CoChangePair]
+    change_coupling_pairs_total: int
+    static_history_disagreement: list[CouplingRow]
+    hidden_coupling_findings: list[CouplingRow]
+    refactor_boundaries: list[CouplingRow]
+
+
+class BehaviourBlock(BehaviourFields):
+    """``run-context.json`` ``behaviour``: B1 coupling, B2 containment, B3."""
+
+    available: bool
+    reason: NotRequired[str]
+    static_modularity_projection: NotRequired[str]
+
+
+class ComplexityCoverage(TypedDict):
+    complexity_summarised: float
+    subject_code_count: int
+    doc_value: float
+
+
+class DocumentationBlock(TypedDict):
+    """``run-context.json`` ``documentation``: freshness, coverage, Signal C."""
+
+    available: bool
+    reason: NotRequired[str]
+    high_ccn_threshold: NotRequired[float | None]
+    freshness_by_doc: dict[str, float]
+    complexity_coverage: dict[str, ComplexityCoverage]
+    # ``doc_complexity_join.DocUnit`` rows, read from its JSON-shaped result.
+    stale_doc_on_complexity: list[JsonDict]
+    unexplained_complexity: list[JsonDict]
+    good_contracts: NotRequired[list[JsonDict]]
+
+
+class UnderstandingBlock(TypedDict):
+    """``run-context.json`` ``understanding``: anchor, intent source, authorship."""
+
+    available: bool
+    reason: NotRequired[str]
+    high_ccn_threshold: NotRequired[float | None]
+    human_anchor_by_path: dict[str, bool]
+    intent_source_by_path: dict[str, bool]
+    authorship_class_by_path: dict[str, str]
+    orphaned_understanding: list[str]
+    # ``understanding_analysis.UnderstandingModule`` rows, read from its
+    # JSON-shaped result.
+    modules: NotRequired[list[JsonDict]]
+
+
+class StaticReachability(TypedDict):
+    """``runtime.static_reachability``: the dead-code candidates, re-exposed."""
+
+    available: bool
+    candidate_count: int
+    candidates: list[DeadCodeCandidate]
+    # Absent only on the fallback a failed runtime build degrades to.
+    tools: NotRequired[list[DeadCodeTool]]
+    caveat: NotRequired[str]
+
+
+class RuntimeBlock(TypedDict):
+    """``run-context.json`` ``runtime``: D1 static reachability + observability rung."""
+
+    available: bool
+    reason: NotRequired[str]
+    static_reachability: StaticReachability
+    observability_rung: int | None
+    runtime_evidence_available: bool
+
+
+class FindingPaths(TypedDict):
+    """The part of a derived finding the path filters read and rewrite."""
+
+    name: str
+    paths: list[str]
+
+
+class DerivedFinding(FindingPaths):
+    """One ``derived_findings`` row: a named finding, its paths and its action."""
+
+    action: str
+
+
+class AttentionRow(TypedDict):
+    """One ``attention`` row: a unit and the negative findings that name it."""
+
+    path: str
+    findings: list[str]
+    score: int
+
+
+class PrescribedAction(TypedDict):
+    """One ``prescribed_actions`` row: an attention unit's mandatory action."""
+
+    path: str
+    action: str
+    findings: list[str]
+    rank: int
+
+
+class KeyholeConcern(TypedDict):
+    name: str
+    count: int
+
+
+class KeyholeSummary(TypedDict):
+    """``run-context.json`` ``keyhole_summary``."""
+
+    concerns: list[KeyholeConcern]
+    safe_zones: int
+    total_concerns: int
+    summary_text: str
+
+
+class FindingProducts(TypedDict):
+    """The attention list and report products derived from the findings."""
+
+    attention: list[AttentionRow]
+    findings_markdown: str
+    keyhole_summary: KeyholeSummary
+    attention_low_signal: bool
+    prescribed_actions: list[PrescribedAction]
+    archived_finding_paths: list[str]
+
+
+class KeyholeIntegration(FindingProducts):
+    """``keyhole_signals.integrate``'s result, which ``context_blocks`` copies into ctx."""
+
+    # The structure block and the Tier 1 grouping disagreement come from other
+    # modules as JSON-shaped dicts.
+    structure: JsonDict
+    behaviour: BehaviourBlock
+    documentation: DocumentationBlock
+    understanding: UnderstandingBlock
+    runtime: RuntimeBlock
+    derived_findings: list[DerivedFinding]
+    excluded_finding_paths: list[str]
+    pruned_finding_paths: list[str]
+    rename_map_complete: bool
+    structure_drift_tier1: JsonDict
+
+
+# --- complexity-treemap: the stats sidecar --------------------------------
+#
+# Written by ``complexity-treemap.py`` to ``complexity-stats.json`` and read
+# back as JSON by ``assess_core`` and ``stats_diff``. Kept here so the
+# treemap stays under its file-size ceiling.
+
+class GeneratedExclusion(TypedDict):
+    """A file ``collect`` dropped as generated, in ``excluded_generated``."""
+
+    path: str
+    reason: str
+
+
+class Distribution(TypedDict):
+    """``{p50, p95, max}`` of one metric; every field 0.0 when empty."""
+
+    p50: float
+    p95: float
+    max: float
+
+
+class SizeBlock(Distribution):
+    """The ``loc`` / ``est_tokens`` block: distribution, code/data maxima, total."""
+
+    max_code: float
+    max_data: float
+    total: int
+
+
+class SubtreeTokens(TypedDict):
+    path: str
+    est_tokens: int
+
+
+class KeyholeBudget(TypedDict):
+    """``est_tokens.budget``: per-file tokens against one context window."""
+
+    total: int
+    budget: int
+    budget_basis: str
+    chars_per_token: int
+    files_over_budget: int
+    subtrees_over_budget: int
+    over_budget_subtrees: list[SubtreeTokens]
+
+
+class FnBackendSource(TypedDict):
+    name: str
+    approximate: bool
+
+
+class FnCcnBlock(Distribution):
+    """``fn_ccn``: the per-function complexity distribution and its backends."""
+
+    basis: str
+    source: list[FnBackendSource]
+    backend_by_language: dict[str, str | None]
+    function_count: int
+
+
+class HotspotRow(TypedDict):
+    """One ``top_hotspots`` / ``top_complex`` / ``top_large`` row."""
+
+    path: str
+    loc: int
+    est_tokens: int
+    ccn: float
+    ccn_basis: str
+    max_fn_ccn: float | None
+    max_fn_name: str | None
+    # None when churn is unavailable (no git), distinct from a real 0.
+    commits: int | None
+    source: str
+
+
+class ScoredHotspotRow(HotspotRow):
+    """A row before ranking, carrying the private composite score."""
+
+    _score: float
+
+
+# --- assess_finalize: the LLM write-back input -----------------------------
+#
+# Read only by the ``assess_finalize`` orchestrator; kept here so the
+# orchestrator stays under its file-size ceiling.
+
+class FinalizeInput(TypedDict):
+    """``finalize-input.json``: the values the model derived for the wiki.
+
+    Model-authored, so untrusted: ``assess_finalize`` re-checks each value
+    before it writes. The types are what the contract asks for, not a proof.
+    """
+
+    score: float
+    maturity_label: str
+    top_action: str
+    run_id: NotRequired[str]
+    # 8 for a software repo, the applicable-layer count for a knowledge base.
+    denominator: NotRequired[int]
+    hotspot_actions: NotRequired[dict[str, list[str]]]
+    # Layer id to its 0.0/0.5/1.0 band; an int key is tolerated beside the
+    # JSON string key, so the keys are not uniform.
+    layer_scores: NotRequired[JsonDict]
+    # Action-contract rows keep whatever extra keys the model supplied.
+    actions: NotRequired[list[JsonDict]]
+    evidence: NotRequired[list[JsonDict]]
+
+
+class ActionLifecycle(TypedDict):
+    """The executor fields ``actions.json`` carries forward across runs."""
+
+    status: str
+    # Copied as found from the prior contract, which is hand-editable JSON.
+    claimed_by: Any
+    completed_sha: Any
+
+
+# --- instruction_discovery: the nested_instructions block -----------------
+
+class InstructionScope(TypedDict):
+    """Where a discovered instruction file applies.
+
+    ``directory`` is the repo-relative directory a nested file governs ("."
+    for the root); ``globs`` the path patterns a rule file names (empty for a
+    directory file or a rule with none). ``always_loaded`` is True when the
+    tool loads the file at session start for the root context.
+    """
+
+    directory: str
+    globs: list[str]
+    always_loaded: bool
+
+
+class GradeFinding(TypedDict):
+    """A grader finding: a command naming a missing target, or a stale path or symbol (#512)."""
+
+    kind: Literal["unresolved_command", "stale_path", "stale_symbol"]
+    line: int
+    reference: str
+    reason: str
+
+
+class NestedInstructionFile(TypedDict):
+    """One graded entry in ``nested_instructions.files``."""
+
+    path: str
+    tool: str
+    kind: str
+    scope: InstructionScope
+    grade: str
+    score: int
+    subscores: dict[str, int]
+    findings: list[GradeFinding]
+    freshness_days: int
+    line_count: int
+
+
+class InstructionFinding(TypedDict):
+    """One integrity finding in ``nested_instructions.findings``.
+
+    ``kind`` is ``dead_glob``, ``ignored_cursor_md``, ``claude_shadows_agents``
+    or ``repeats_parent``; ``detail`` is a one-line description and ``pattern``
+    (a dead rule's comma-joined patterns) / ``parent`` / ``overlap`` carry the
+    kind's evidence.
+    """
+
+    kind: str
+    path: str
+    detail: str
+    pattern: NotRequired[str]
+    parent: NotRequired[str]
+    overlap: NotRequired[float]
+
+
+class SkippedImport(TypedDict):
+    """An ``@import`` the Claude Code budget did not follow, and why."""
+
+    source: str
+    target: str
+    reason: str
+
+
+class InstructionTotals(TypedDict):
+    """Size of a set of always-loaded instruction files."""
+
+    files: list[str]
+    lines: int
+    words: int
+    bytes: int
+    est_tokens: int
+
+
+class ClaudeCodeBudget(InstructionTotals):
+    """Root CLAUDE.md, its ``@imports`` and the unscoped ``.claude/rules``."""
+
+    skipped_imports: list[SkippedImport]
+
+
+class CodexChain(InstructionTotals):
+    """The root-down AGENTS.md chain Codex joins for one directory."""
+
+    directory: str
+    exceeds_limit: bool
+
+
+class CodexBudget(InstructionTotals):
+    """Root AGENTS.md against Codex's ``project_doc_max_bytes``."""
+
+    limit_bytes: int
+    exceeds_limit: bool
+    deepest_chain: CodexChain | None
+
+
+class InstructionBudget(TypedDict):
+    """Always-loaded instruction text per tool for the root context."""
+
+    chars_per_token: int
+    claude_code: ClaudeCodeBudget
+    codex: CodexBudget
+
+
+class NestedInstructionsBlock(TypedDict):
+    """``run-context.json`` ``nested_instructions``."""
+
+    available: bool
+    files: list[NestedInstructionFile]
+    files_total: int
+    budget: InstructionBudget
+    findings: list[InstructionFinding]
+    findings_total: int

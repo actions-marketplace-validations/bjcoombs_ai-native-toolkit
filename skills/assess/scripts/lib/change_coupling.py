@@ -27,6 +27,9 @@ import subprocess
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
+from typing import TypedDict
+
+from lib.run_context_types import CoChangePair as CoChangePair
 
 # Cap every git call so a stuck invocation (huge repo, lock contention, a hung
 # credential prompt) degrades to "no data" rather than blocking the run. Same
@@ -241,9 +244,37 @@ def fold_renames(
     ]
 
 
+class Contributor(TypedDict):
+    """B4: one author's commit and line totals on a path."""
+
+    name: str
+    email: str
+    commits: int
+    lines_added: int
+    lines_removed: int
+    classification: str
+
+
+class Authorship(TypedDict):
+    """B4: :func:`authorship_analysis`'s verdict for one path."""
+
+    human_anchor: bool
+    authorship_class: str
+    intent_source: bool
+    contributors: list[Contributor]
+
+
+class SelfReferentialTest(TypedDict):
+    """E2: a test added in the same commit as the code it covers."""
+
+    test_file: str
+    source_file: str
+    reason: str
+
+
 def change_coupling_pairs(
     commit_sets: list[set[Path]], min_support: int = 3,
-) -> list[dict]:
+) -> list[CoChangePair]:
     """B1: file pairs that co-change, from :func:`parse_commit_file_sets` output.
 
     For every commit, all unordered file pairs are tallied; a pair is reported
@@ -267,7 +298,7 @@ def change_coupling_pairs(
             key = (str(a), str(b))
             counts[key] = counts.get(key, 0) + 1
 
-    pairs = [
+    pairs: list[CoChangePair] = [
         {
             "file_a": a,
             "file_b": b,
@@ -277,9 +308,7 @@ def change_coupling_pairs(
         for (a, b), count in counts.items()
         if count >= min_support
     ]
-    # dict values are heterogeneous (str | int | float), so mypy types the
-    # lookup as ``object``; the negation is valid at runtime (count is int).
-    pairs.sort(key=lambda d: (-d["co_change_count"], d["file_a"], d["file_b"]))  # type: ignore[operator]
+    pairs.sort(key=lambda d: (-d["co_change_count"], d["file_a"], d["file_b"]))
     return pairs
 
 
@@ -372,7 +401,7 @@ def _coauthors_have_agent(coauthor_field: str) -> bool:
     return False
 
 
-def authorship_analysis(repo_root: Path, path: Path | str) -> dict:  # noqa: C901  # multi-signal B4 heuristic; ccn 19, ratchet target
+def authorship_analysis(repo_root: Path, path: Path | str) -> Authorship:  # noqa: C901  # multi-signal B4 heuristic; ccn 19, ratchet target
     """B4: human-anchor / intent-source signals and a conservative class for ``path``.
 
     Returns ``{human_anchor, authorship_class, intent_source, contributors}``:
@@ -393,7 +422,7 @@ def authorship_analysis(repo_root: Path, path: Path | str) -> dict:  # noqa: C90
     intent_source: False, contributors: []}`` when there is no git history (path
     untracked, repo absent, git missing/slow).
     """
-    default = {
+    default: Authorship = {
         "human_anchor": False,
         "authorship_class": "unknown",
         "intent_source": False,
@@ -421,7 +450,7 @@ def authorship_analysis(repo_root: Path, path: Path | str) -> dict:  # noqa: C90
     n_unknown = 0
     intent_source = False
     # Aggregate per author identity (name, email).
-    contributors: dict[tuple[str, str], dict] = {}
+    contributors: dict[tuple[str, str], Contributor] = {}
     total_commits = 0
 
     for chunk in raw.split("\x1e"):
@@ -515,7 +544,7 @@ def find_self_referential_tests(
     repo_root: Path,
     test_to_code_map: dict[str, str],
     commit_sets: list[set[Path]] | None = None,
-) -> list[dict]:
+) -> list[SelfReferentialTest]:
     """E2: tests added in the same commit as the code they cover.
 
     A test introduced alongside its subject in one commit risks verifying
@@ -536,7 +565,7 @@ def find_self_referential_tests(
     if commit_sets is None:
         commit_sets = parse_commit_file_sets(Path(repo_root))
     commit_path_sets = [{str(f) for f in files} for files in commit_sets]
-    self_ref: list[dict] = []
+    self_ref: list[SelfReferentialTest] = []
     for test_file, source_file in sorted(test_to_code_map.items()):
         for paths in commit_path_sets:
             if test_file in paths and source_file in paths:

@@ -5,10 +5,20 @@ Merges the mutation tier and the cheap always-on heuristics into one
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
-from .heuristics import compute_cheap_heuristics
+from lib.run_context_types import (
+    CheapHeuristics,
+    MutationFileResult,
+    SurvivorCluster,
+    SurvivorDensity,
+    TestPressureBlock,
+)
+
+from .heuristics import CoverageData, compute_cheap_heuristics
 from .mutation import (
     compute_gap_signal,
     compute_survivor_density,
@@ -21,17 +31,20 @@ from .mutation import (
 @dataclass
 class TestPressureResult:
     mutation_config_present: bool = False
-    mutation_tools_detected: list = field(default_factory=list)
+    mutation_tools_detected: list[str] = field(default_factory=list)
     ci_integrated: bool = False
     mutation_run: bool = False
-    mutation_scope: list = field(default_factory=list)
-    per_file: list = field(default_factory=list)
-    survivor_density: dict = field(default_factory=dict)
-    survivor_clusters: list = field(default_factory=list)
+    mutation_scope: list[str] = field(default_factory=list)
+    per_file: list[MutationFileResult] = field(default_factory=list)
+    # Empty until scan_test_pressure fills it; the cast names that, not a shape.
+    survivor_density: SurvivorDensity = field(
+        default_factory=lambda: cast(SurvivorDensity, {}))
+    survivor_clusters: list[SurvivorCluster] = field(default_factory=list)
     gap_signal: str = "not assessed"
-    cheap_heuristics: dict = field(default_factory=dict)
+    cheap_heuristics: CheapHeuristics = field(
+        default_factory=lambda: cast(CheapHeuristics, {}))
 
-    def as_dict(self) -> dict:
+    def as_dict(self) -> TestPressureBlock:
         return {
             "mutation_config_present": self.mutation_config_present,
             "mutation_tools_detected": self.mutation_tools_detected,
@@ -46,7 +59,7 @@ class TestPressureResult:
         }
 
 
-def _overall_coverage(coverage_data) -> float | None:
+def _overall_coverage(coverage_data: CoverageData | None) -> float | None:
     """Reduce coverage_data to a single line-coverage ratio, if supplied.
     We only have covered lines, not total lines, so we cannot compute a true
     ratio here - return None unless an explicit ``{"_overall": ratio}`` is
@@ -58,8 +71,9 @@ def _overall_coverage(coverage_data) -> float | None:
     return None
 
 
-def scan_test_pressure(repo_root: Path, hot_files: list | None = None,
-                       opt_in: bool = False, coverage_data=None) -> dict:
+def scan_test_pressure(repo_root: Path, hot_files: Sequence[str | Path] | None = None,
+                       opt_in: bool = False,
+                       coverage_data: CoverageData | None = None) -> TestPressureBlock:
     """Top-level Layer-1 write-side scan. Merges the mutation tier and the cheap
     always-on heuristics into one ``test_pressure`` block ready to drop into
     run-context.json. Never raises.
@@ -99,4 +113,8 @@ def scan_test_pressure(repo_root: Path, hot_files: list | None = None,
     # Surface why a mutation run didn't happen, for the report prose.
     if "reason" in mutation:
         block["mutation_note"] = mutation["reason"]
+    # Per-package runs of the mutmut 3 pass, each with its own reason when it
+    # could not run, so a partial pass says which package fell short and why.
+    if "groups" in mutation:
+        block["mutation_groups"] = mutation["groups"]
     return block

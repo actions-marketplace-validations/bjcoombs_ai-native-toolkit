@@ -49,12 +49,30 @@ the core.
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
+from typing import TypedDict
 
-# Code that churns more than this multiple of its doc's own churn is treated as
-# having outrun the map: freshness crosses zero here and reaches -1 at twice
-# this ratio. 2.0 = "the code changed twice as often as anyone touched the doc".
-# The doc-staleness metric already computes this ratio (code_churn / doc_churn)
-# as its core decaying-map signal; we only map it onto a signed scale.
+from lib.run_context_types import JsonDict
+
+
+class DocUnit(TypedDict):
+    """One ``documentation.docs`` row: a doc, or undocumented complex code."""
+
+    path: str
+    complexity_summarised: float
+    freshness: float
+    doc_value: float
+    finding: str | None
+    confidence: str | None
+    subject_code_count: int
+    recommendation: str | None
+
+# A doc whose staleness ratio exceeds this is treated as having been outrun by
+# its code: freshness crosses zero here and reaches -1 at twice this value. The
+# doc-staleness metric computes the ratio (whole-window code_churn / doc_churn,
+# capped by the distinct subject commits since the doc's last content change
+# when the doc changed inside the window), so for a recently edited doc 2.0
+# means "more than two subject commits landed after the doc last changed". We
+# only map it onto a signed scale.
 STALENESS_RATIO_THRESHOLD = 2.0
 
 # McCabe's classic "moderate risk" line. We gate findings on the *higher* of
@@ -87,7 +105,7 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def _extract_file_ccn(complexity_stats: dict) -> dict[str, float]:
+def _extract_file_ccn(complexity_stats: JsonDict) -> dict[str, float]:
     """Build path -> max-CCN from whatever per-file lists the stats expose.
 
     ``complexity-stats.json`` carries per-file CCN only in its ranked lists
@@ -108,13 +126,13 @@ def _extract_file_ccn(complexity_stats: dict) -> dict[str, float]:
     return ccn
 
 
-def _high_ccn_threshold(complexity_stats: dict) -> float:
+def _high_ccn_threshold(complexity_stats: JsonDict) -> float:
     """The CCN at or above which a unit counts as 'high complexity'."""
     p95 = float((complexity_stats.get("ccn") or {}).get("p95", 0.0) or 0.0)
     return max(p95, MIN_HIGH_CCN)
 
 
-def _signed_freshness(doc: dict) -> float:
+def _signed_freshness(doc: JsonDict) -> float:
     """Map the doc's staleness state onto a signed freshness in [-1, +1].
 
     **Generated docs with declared provenance** (issue #178) bypass the churn
@@ -130,9 +148,10 @@ def _signed_freshness(doc: dict) -> float:
     comparison was indeterminate (no usable timestamps), so we fall back to the
     churn ratio below.
 
-    Otherwise (the ordinary hand-written doc), ``ratio`` (code churn per unit of
-    doc maintenance) is the decaying-map signal: 0 when the code is as quiet as
-    the doc, large when the code churns while the doc sits frozen.
+    Otherwise (the ordinary hand-written doc), ``ratio`` (the window churn ratio
+    capped by the distinct subject commits since the doc's last content change; see
+    ``lib.doc_staleness``) is the decaying-map signal: 0 when the doc is not
+    behind its subject, large when the code churns while the doc sits frozen.
     Piecewise-linear::
 
         ratio = 0                       -> +1.0  (doc fully keeps pace)
@@ -189,8 +208,8 @@ def _assign_code_to_docs(
 
 
 def analyze_doc_complexity_join(
-    complexity_stats: dict, doc_staleness: dict, repo_root: Path,
-) -> dict:
+    complexity_stats: JsonDict, doc_staleness: JsonDict, repo_root: Path,
+) -> JsonDict:
     """Join complexity hotspots with doc freshness into Signal C findings.
 
     Args:
@@ -244,10 +263,10 @@ def analyze_doc_complexity_join(
     assignment = _assign_code_to_docs(list(file_ccn), doc_paths)
     covered_code = {c for codes in assignment.values() for c in codes}
 
-    units: list[dict] = []
-    lying_maps: list[dict] = []
-    unexplained: list[dict] = []
-    good_contracts: list[dict] = []
+    units: list[DocUnit] = []
+    lying_maps: list[DocUnit] = []
+    unexplained: list[DocUnit] = []
+    good_contracts: list[DocUnit] = []
 
     # --- Real docs: classify by (complexity it covers) x (its freshness) ---
     for doc in docs_in:
@@ -296,7 +315,7 @@ def analyze_doc_complexity_join(
             elif freshness > 0:
                 finding = "good_contract"
 
-        unit = {
+        unit: DocUnit = {
             "path": path,
             "complexity_summarised": complexity_summarised,
             "freshness": freshness,

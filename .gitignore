@@ -5,7 +5,6 @@
 !/.gitignore
 !/.claude-plugin/
 !/agents/
-!/commands/
 !/skills/
 !/LICENSE
 !/FLOOR.md
@@ -16,6 +15,8 @@
 dist/standalone-skills/
 !/.github/
 !/action.yml
+!/.file-size-ratchet.toml
+!/Makefile
 
 # /assess output: we dogfood /assess on this repo, so its compounding wiki and
 # latest report ARE tracked (the report, both SVGs, the stats baseline for the
@@ -35,8 +36,20 @@ dist/standalone-skills/
 **/.pytest_cache/
 **/.venv/
 **/uv.lock
+# The two uv projects commit their lockfiles: CI runs `uv run --locked` against
+# them and `make setup` syncs from them. Any other uv.lock (a scratch copy, a
+# test run inside a fixture) stays ignored.
+!/skills/assess/uv.lock
+!/scripts/uv.lock
 **/.coverage
 **/.coverage.*
+# Line-coverage reports (pytest-cov / coverage.py output). The parser fixtures
+# under skills/assess/tests/fixtures/ are committed test inputs.
+**/coverage.xml
+**/lcov.info
+**/htmlcov/
+!/skills/assess/tests/fixtures/coverage.xml
+!/skills/assess/tests/fixtures/lcov.info
 
 # Ignore nested CLAUDE.md files (e.g. user's personal config when they
 # clone this into ~/.claude/). The root /CLAUDE.md is re-allowlisted
@@ -54,3 +67,6 @@ dist/standalone-skills/
 # always-loaded CLAUDE.md with a count-surface trap (issue #226). Committed so
 # the contract test has an input on CI.
 !/skills/skill-forge/tests/fixtures/flawed-instruction-file/CLAUDE.md
+# mutmut 3 working tree (see [tool.mutmut] in skills/assess/pyproject.toml).
+# The src -> scripts link that config mutates through is committed, not ignored.
+/skills/assess/mutants/

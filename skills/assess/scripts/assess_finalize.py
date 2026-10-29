@@ -47,6 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.badge import maturity_band
 from lib.evidence_check import check_evidence, describe
 from lib.keyhole_signals import mode_for_finding
+from lib.mutation_cap import layer6_cap_violation
+from lib.run_context_types import ActionLifecycle, FinalizeInput, JsonDict
 from lib.wiki_writer import (
     find_log_entry,
     log_entry_date,
@@ -71,7 +73,8 @@ class FinalizeValidationError(Exception):
     contract that lets a downstream reader trust the finalised wiki: the score
     fits its denominator, the maturity label matches the score band, every
     hotspot action names a real hotspot, the input came from *this* run (run_id),
-    Layer 6 never claims proof (Present) the run never gathered (no mutation),
+    Layer 6 never claims proof (Present) the run never gathered (no mutation,
+    or only partial mutation),
     and no layer verdict rests only on evidence that fails its re-check.
     """
 
@@ -81,12 +84,6 @@ class FinalizeValidationError(Exception):
 # "Knowledge Base · Solid (3 applicable layers)"). No pair is a substring of
 # another, so a single containment test per keyword is unambiguous.
 _MATURITY_KEYWORDS = ("AI-Native", "Not Ready", "Solid", "Basic")
-
-# The annotation the LLM must attach to Layer 6 when mutation testing never ran.
-# Mirrors ``assess_core.MUTATION_NOT_RUN_ANNOTATION`` (the two scripts share no
-# import, so the literal is duplicated); the finalize error names it so a caller
-# knows the required remediation.
-MUTATION_NOT_RUN_ANNOTATION = "truth-pressure unproven (mutation not run)"
 
 
 def _log_target(assess_dir: Path, run_id: str | None) -> int | None:
@@ -253,7 +250,7 @@ ACTION_STATUS_VALUES = frozenset({"pending", "claimed", "done", "reopened"})
 _ACTION_CARRY_FIELDS = ("status", "claimed_by", "completed_sha")
 
 
-def _action_paths(entry: dict) -> frozenset[str]:
+def _action_paths(entry: JsonDict) -> frozenset[str]:
     """The files an action names, as a set.
 
     The ``files`` list is the source; a singular ``path`` is accepted as a
@@ -275,7 +272,7 @@ def _action_paths(entry: dict) -> frozenset[str]:
     return frozenset(paths)
 
 
-def _action_identity_key(entry: dict) -> str | None:
+def _action_identity_key(entry: JsonDict) -> str | None:
     """The deterministic identity of an action: its finding plus its paths.
 
     Rank reshuffles between runs and the directive text is written afresh by the
@@ -295,7 +292,7 @@ def _action_identity_key(entry: dict) -> str | None:
     return "\x00".join(["finding", finding, *sorted(paths)])
 
 
-def _action_text_key(entry: dict) -> str | None:
+def _action_text_key(entry: JsonDict) -> str | None:
     """The fallback identity: the action directive text, as written.
 
     ``None`` for an empty directive: ``ACTION_REQUIRED_KEYS`` checks that the
@@ -306,7 +303,7 @@ def _action_text_key(entry: dict) -> str | None:
     return "\x00".join(["action", text]) if isinstance(text, str) and text else None
 
 
-def _read_prior_action_status(assess_dir: Path) -> dict[str, list[dict]]:
+def _read_prior_action_status(assess_dir: Path) -> dict[str, list[JsonDict]]:
     """Prior actions indexed for status carry-forward, by identity and by text.
 
     Each prior entry is registered under every key it can be found by: its
@@ -335,7 +332,7 @@ def _read_prior_action_status(assess_dir: Path) -> dict[str, list[dict]]:
         prior = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
-    out: dict[str, list[dict]] = {}
+    out: dict[str, list[JsonDict]] = {}
     for a in prior.get("actions", []) if isinstance(prior, dict) else []:
         if not isinstance(a, dict):
             continue
@@ -345,7 +342,7 @@ def _read_prior_action_status(assess_dir: Path) -> dict[str, list[dict]]:
     return out
 
 
-def _match_prior_action(prior: dict[str, list[dict]], action: dict) -> dict:
+def _match_prior_action(prior: dict[str, list[JsonDict]], action: JsonDict) -> JsonDict:
     """The prior entry for this action: identity first, then the text fallback.
 
     Identity wins because it survives a rewording. Text is tried second because
@@ -386,7 +383,7 @@ def _match_prior_action(prior: dict[str, list[dict]], action: dict) -> dict:
     if text is None:
         return {}
     new_paths = _action_paths(action)
-    nothing_to_compare: dict = {}
+    nothing_to_compare: JsonDict = {}
     for candidate in prior.get(text, []):
         prior_paths = _action_paths(candidate)
         if new_paths and prior_paths:
@@ -397,7 +394,7 @@ def _match_prior_action(prior: dict[str, list[dict]], action: dict) -> dict:
     return nothing_to_compare
 
 
-def _carry_status_fields(prior_entry: dict) -> dict:
+def _carry_status_fields(prior_entry: JsonDict) -> ActionLifecycle:
     """The lifecycle fields to inherit from a matching prior action.
 
     An unrecognised prior status resets to ``pending`` (a corrupted or
@@ -414,7 +411,7 @@ def _carry_status_fields(prior_entry: dict) -> dict:
 
 
 def _write_actions_contract(
-    assess_dir: Path, actions: list[dict], *, run_id: str | None = None
+    assess_dir: Path, actions: list[JsonDict], *, run_id: str | None = None
 ) -> None:
     """Write the durable machine-readable Top 3 contract to actions.json (v2).
 
@@ -455,9 +452,7 @@ def _write_actions_contract(
         "run_id": run_id,
         "actions": entries,
     }
-    (assess_dir / "actions.json").write_text(
-        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
-    )
+    (assess_dir / "actions.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _locate_input(assess_dir: Path) -> Path:
@@ -475,7 +470,7 @@ def _locate_input(assess_dir: Path) -> Path:
     )
 
 
-def _load_run_context(assess_dir: Path) -> dict:
+def _load_run_context(assess_dir: Path) -> JsonDict:
     """Load run-context.json, the ground truth finalize reconciles against.
 
     Its absence is a hard failure, not a skip: finalize *reconciles* the
@@ -490,11 +485,12 @@ def _load_run_context(assess_dir: Path) -> dict:
             "LLM input against the deterministic core's output; refusing to write"
         )
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        ctx: JsonDict = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
         raise FinalizeValidationError(
             f"run-context.json at {path} is not valid JSON: {e}"
         ) from e
+    return ctx
 
 
 def _claimed_maturity_tier(label: str) -> str | None:
@@ -509,7 +505,7 @@ def _claimed_maturity_tier(label: str) -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
-def _layer_score(data: dict, layer: int) -> float | None:
+def _layer_score(data: FinalizeInput, layer: int) -> float | None:
     """The LLM-supplied numeric score for one layer, or None if not carried.
 
     ``layer_scores`` maps a layer id to its 0.0/0.5/1.0 band (Missing/Partial/
@@ -529,7 +525,7 @@ def _layer_score(data: dict, layer: int) -> float | None:
     return None
 
 
-def _validate_run_id_match(data: dict, ctx: dict) -> None:
+def _validate_run_id_match(data: FinalizeInput, ctx: JsonDict) -> None:
     """Both artifacts must be from the same run (torn-write detection).
 
     Only enforced when *both* carry a run_id: a legacy artifact missing the
@@ -547,7 +543,7 @@ def _validate_run_id_match(data: dict, ctx: dict) -> None:
         )
 
 
-def _validate_denominator(denominator: int, ctx: dict) -> None:
+def _validate_denominator(denominator: int, ctx: JsonDict) -> None:
     """The finalize-input denominator must match the archetype's.
 
     Skipped when the archetype scan degraded (no available block / no
@@ -595,7 +591,7 @@ def _validate_maturity(score: float, denominator: int, label: str) -> None:
         )
 
 
-def _validate_hotspot_actions(data: dict, ctx: dict) -> None:
+def _validate_hotspot_actions(data: FinalizeInput, ctx: JsonDict) -> None:
     """Every hotspot_actions key must be a real top hotspot from run-context.
 
     A path the LLM invented (not in ``stats_summary.top_hotspots``) is a
@@ -606,7 +602,7 @@ def _validate_hotspot_actions(data: dict, ctx: dict) -> None:
         return
     stats_summary = ctx.get("stats_summary")
     top = stats_summary.get("top_hotspots", []) if isinstance(stats_summary, dict) else []
-    known = {h.get("path") for h in top if isinstance(h, dict) and h.get("path")}
+    known = {p for h in top if isinstance(h, dict) and (p := h.get("path"))}
     for path in hotspot_actions:
         if path not in known:
             raise FinalizeValidationError(
@@ -616,33 +612,16 @@ def _validate_hotspot_actions(data: dict, ctx: dict) -> None:
             )
 
 
-def _validate_layer6_cap(data: dict, ctx: dict) -> None:
-    """Layer 6 cannot exceed Partial when mutation testing never ran.
+def _validate_layer6_cap(data: FinalizeInput, ctx: JsonDict) -> None:
+    """Layer 6 cannot exceed Partial without complete mutation evidence.
 
-    ``mutation_not_run_cap.mutation_run`` (or, for a run-context that predates
-    the block, ``test_pressure.mutation_run``) is True only when the bounded
-    mutation pass actually executed. Without it, a Present verdict (score > 0.5)
-    for Layer 6 is an unproven self-description - the guardrail-erosion failure
-    /assess exists to catch - so finalize refuses it. A legacy input carrying no
-    ``layer_scores`` is exempt (nothing to check).
+    The rule lives in ``lib.mutation_cap.layer6_cap_violation``: Present is
+    refused when mutation did not run, or ran with every group stopped at the
+    budget. A legacy input carrying no ``layer_scores`` is exempt.
     """
-    cap = ctx.get("mutation_not_run_cap")
-    if isinstance(cap, dict):
-        mutation_ran = bool(cap.get("mutation_run", False))
-    else:
-        tp = ctx.get("test_pressure")
-        mutation_ran = bool(isinstance(tp, dict) and tp.get("mutation_run", False))
-    if mutation_ran:
-        return
-    layer6 = _layer_score(data, 6)
-    if layer6 is None:
-        return
-    if layer6 > 0.5:
-        raise FinalizeValidationError(
-            "Layer 6 cannot exceed Partial when mutation testing was not run "
-            f"(scored {layer6}). Annotation required: "
-            f"'{MUTATION_NOT_RUN_ANNOTATION}'"
-        )
+    violation = layer6_cap_violation(ctx, _layer_score(data, 6))
+    if violation:
+        raise FinalizeValidationError(violation)
 
 
 def _evidence_layer(entry: object) -> int | None:
@@ -655,7 +634,7 @@ def _evidence_layer(entry: object) -> int | None:
     return layer
 
 
-def _validate_evidence(data: dict, repo_root: Path) -> list[dict]:
+def _validate_evidence(data: FinalizeInput, repo_root: Path) -> list[JsonDict]:
     """Re-check the input's ``evidence`` list against the repository (#362).
 
     The scorer is a model, and the facts it cites ("docs/guide.md is absent",
@@ -707,8 +686,8 @@ def _validate_evidence(data: dict, repo_root: Path) -> list[dict]:
 
 
 def _validate_finalize_input(
-    data: dict, ctx: dict, *, denominator: int, repo_root: Path
-) -> list[dict]:
+    data: FinalizeInput, ctx: JsonDict, *, denominator: int, repo_root: Path
+) -> list[JsonDict]:
     """Run every finalize invariant. Raises FinalizeValidationError on the first
     violation, before any write - so a bad input reaches nothing.
 
@@ -734,7 +713,7 @@ def finalize_run(*, assess_dir: Path) -> None:
     ``FinalizeValidationError`` and nothing is written.
     """
     input_path = _locate_input(assess_dir)
-    data = json.loads(input_path.read_text(encoding="utf-8"))
+    data: FinalizeInput = json.loads(input_path.read_text(encoding="utf-8"))
     ctx = _load_run_context(assess_dir)
     # Denominator: 8 for a software repo (the display ceiling), or the count of
     # applicable layers for a knowledge base (issue #224). Defaults to 8 so a

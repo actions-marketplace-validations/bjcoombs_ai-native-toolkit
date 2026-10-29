@@ -1,34 +1,41 @@
 # CLAUDE.md
 
-In-repo contract for agents editing `ai-native-toolkit`. Repo-specific rules only - global conventions (voice, workflow, worktrees) live in the user's `~/.claude/CLAUDE.md` and aren't repeated here.
+In-repo contract for agents editing `ai-native-toolkit`. Repo-specific rules only; global conventions (voice, workflow, worktrees) live in the user's `~/.claude/CLAUDE.md`. Long reference material lives under `docs/contributing/`, one pointer per topic below.
 
 ## Scope of this repo
 
-Source for the `ai-native-toolkit` Claude Code plugin. Portable skills (`/assess`, `/huddle`, `/deslop`, `/ghsync`, `/skill-forge`, `/semantic-compress`), portable framework commands (`/6hats`, `/understand`), personal workflow commands that are opt-in (`/tm`, `/issues`, `/fix-pr`, `/fix-develop`), and team-orchestration library skills (`marathon`, `pr-review-merge`, `ab-equivalence`) that are composed by the workflow commands and portable skills rather than invoked standalone.
+Source for the `ai-native-toolkit` Claude Code plugin. Portable skills (`/assess`, `/huddle`, `/deslop`, `/ghsync`, `/skill-forge`, `/semantic-compress`), user-invoked framework skills (`/6hats`, `/understand`), opt-in personal workflow skills (`/tm`, `/issues`, `/fix-pr`, `/fix-develop`, `/tm-marathon-config-example`), and team-orchestration library skills (`marathon`, `pr-review-merge`, `ab-equivalence`) composed by the other skills rather than invoked standalone. Every component is a skill under `skills/<name>/SKILL.md` or an agent under `agents/`; there is no `commands/` directory.
 
-The deliverable is markdown: agents, commands, skills. It also ships a Python deterministic core under `skills/assess/scripts/` (plus `lib/`) and a standalone-skill build pipeline under `scripts/`. There is no application runtime, but there are pytest suites (`skills/assess/`, `scripts/`), a ruff + mypy lint gate, and a standalone-ZIP build step - all enforced in CI.
+The deliverable is markdown, plus a Python deterministic core under `skills/assess/scripts/` (with `lib/`) and a standalone-skill build under `scripts/`. No application runtime. The pytest suites, the ruff + mypy gates and the floor checks gate merge.
 
 ## North star
 
-Everything here serves one goal: make an AI contributor feel like an engineer who has been in the org eighteen months, not a brand-new hire. The difference is *externalized context*, not capability. An AI is structurally always the new hire - each session starts with an empty head and one narrow context window - so the codebase has to supply the tenure: a navigable map, load-bearing contracts made explicit, complexity made *locally* legible so the relevant slice fits one keyhole.
+Make an AI contributor feel like an engineer eighteen months into the org: the codebase supplies the tenure through *externalized context*. Aim for **legibility you can trust, not omniscience you can't**: answers anchored to code a human can spot-check. Guardrails protect the contributor by construction (poka-yoke) against three known tendencies: **accretion** (files only grow), **unactioned intent** (TODO and "remove after" markers nobody keeps) and **guardrail erosion** (loosening a check to turn red green).
 
-The safety half is non-negotiable: the goal is **legibility you can trust, not omniscience you can't.** An agent fluent about code nobody can verify is the dangerous failure, not the win. Answers must stay anchored to code a human can spot-check.
+**Feature test.** Does the change help a fresh agent (the map), keep answers verifiable (trust), *and* make the wrong action hard (guardrails)? Name the tendency each new signal or rule compensates for; one that traces to no failure mode is decoration. Prefer honest-degrade over impressive-but-wrong. Full text: `docs/contributing/north-star.md`.
 
-The other half is the same ethic pointed at the write side: when a contributor makes a mistake, ask "what made it possible, and what would make it impossible next time?" - not "who's to blame". Guardrails (linters, architecture tests, CI gates, coverage, review automation - Layers 3-7) aren't a leash on the AI; they protect the contributor from costly mistakes by design, the way an org protects a human engineer with RBAC and staged environments rather than hope. This is **correctness by construction** / poka-yoke: make the wrong action hard and the right action the path of least resistance.
+## Commands
 
-The write-side mistakes worth guarding against are not hypothetical - they are the known tendencies of an AI contributor, observed across models and worth naming so every guardrail traces to one:
+Run from the repo root.
 
-- **Accretion.** An agent does what is asked, and what is asked is feature after feature. Nothing in that loop ever asks for a refactor, so files only grow. Absent a consciously requested restructuring, size and complexity ratchet monotonically upward.
-- **Unactioned intent.** An agent records promises it never returns to keep: TODO / FIXME / "deprecated, use X" / "remove after migration" comments. These are *promissory markers* - self-descriptions of the code's future with no pressure to come true. Aged and ignored, they are a lying map of intent, exactly as a stale doc is a lying map of behaviour.
-- **Guardrail erosion.** Under pressure to make red go green, an agent loosens the check instead of fixing the root - a suppression here, a skipped test there, a widened threshold - hollowing out the very layers meant to protect it while the scaffolding still reads as Present.
+```bash
+make setup                  # sync the locked dev environments (uv), warn if rg is missing
+make check                  # every merge-gating suite, lint and type check: run before pushing
 
-All three are the same defect: a self-description (the file's shape, the comment's promise, the gate's verdict) under no pressure to stay true. The toolkit's job is to convert each tendency into a deterministic signal (the marker aged by the edits it survived, the file that only ever grows, the suppression count that climbs) and a ratchet that makes the honest action the cheap one.
+# One gate at a time (Makefile targets mirroring the tests.yml jobs; `make help` lists them):
+make test-assess            # skills/assess pytest, with its coverage floor
+make test-scripts           # scripts/ pytest, with its coverage floor
+make test-contract          # plugin contract pytest (tests/)
+make lint                   # ruff and mypy for both packages
 
-**Use this as the feature test.** Judge any change to a skill or report by: does it help a fresh agent (the map), keep its answers verifiable (trust), *and* make the wrong action hard to take (guardrails - protecting the contributor, not policing it)? When adding a signal or rule, name the contributor tendency it compensates for - a guardrail that doesn't trace to a failure mode is decoration. Prefer honest-degrade over impressive-but-wrong, local comprehension over global, and "ground the claim in the file" over a fluent narrative.
+bash scripts/build-standalone-skills.sh   # standalone ZIPs into dist/standalone-skills/
+```
+
+`skills/assess/tests/conftest.py` nulls out global git config for that suite only. The `scripts/` tests and scripts run outside pytest (for example `assess_core.py`) still read it: prefix them with `GIT_CONFIG_GLOBAL=/dev/null` if your config signs commits or runs hooks.
 
 ## Versioning
 
-The plugin follows [semver](https://semver.org). Version lives in `.claude-plugin/plugin.json` under `.version`.
+Semver; the version lives in `.claude-plugin/plugin.json` under `.version`.
 
 | Bump | When |
 |------|------|
@@ -36,88 +43,90 @@ The plugin follows [semver](https://semver.org). Version lives in `.claude-plugi
 | MINOR | New skill, new command, new feature on an existing skill (`--include-artifacts` was a MINOR) |
 | PATCH | Bug fix, doc-only change, refactor with no user-visible effect |
 
-**Bump in the same PR as the change.** Claude Code's `/plugin update` is version-based - users see "already at latest" and miss changes if the version doesn't move. A trailing version-bump PR is a fix-up, not the pattern to follow.
+**Bump in the same PR as the change.** `/plugin update` is version-based: users see "already at latest" and miss changes if the version does not move. A trailing version-bump PR is a fix-up, not the pattern.
 
 ## File conventions
 
 ### `skills/<name>/SKILL.md`
 
-Required frontmatter:
+- `name` - kebab-case, matches the directory name.
+- `description` - **must include a `TRIGGER` clause** naming the user phrases that should activate the skill; Claude Code's router matches on it. Exception: a user-invoked skill must *not* carry one.
+- Bundled executables go under `skills/<name>/scripts/`, reference docs under `skills/<name>/references/`.
 
-- `name` - kebab-case, must match the directory name
-- `description` - **must include a `TRIGGER` clause** describing the user phrases / questions that should activate the skill. Claude Code's skill router matches on this.
+**User-invoked skills** (`/tm`, `/issues`, `/fix-pr`, `/fix-develop`, `/6hats`, `/understand`, `/tm-marathon-config-example`) are slash-command-only:
 
-Bundled executables go under `skills/<name>/scripts/`. Reference docs go under `skills/<name>/references/`.
+- `disable-model-invocation: true` - Claude never loads the skill on its own, so a workflow that commits, pushes or spawns a team cannot fire off a `description` match. Uploaded to Claude Desktop / claude.ai it shows Trigger "Slash command", not "Slash command + auto".
+- `description` - shown in `/help` and the slash menu, with no `TRIGGER` clause, because the router never reads it. `tests/test_plugin_contract.py::test_skill_has_trigger_clause` enforces both directions.
+- `argument-hint` - shown after the command name. Quote a value that opens with `[`, which YAML reads as a list; `test_skill_frontmatter_is_valid_yaml` fails on frontmatter no YAML parser accepts.
+
+`$ARGUMENTS` works in a skill. Bare `$0`..`$9` are substituted in every `SKILL.md`, fenced or not, so write `${0}`, `${1}` (details in `docs/contributing/ci.md`).
 
 ### `agents/<name>.md`
 
-Required frontmatter:
+- `name` - kebab-case, matches the filename.
+- `description` - one-line behaviour summary.
+- `model` - typically `inherit`.
+- `color` - one of: `red`, `blue`, `green`, `yellow`, `purple`, `orange`, `pink`, `cyan`, the set [the sub-agents docs](https://code.claude.com/docs/en/sub-agents.md) list. Any other value is ignored without an error; `test_agent_frontmatter` in `tests/test_plugin_contract.py` enforces the set.
 
-- `name` - kebab-case, must match the filename
-- `description` - one-line behaviour summary
-- `model` - typically `inherit`
-- `color` - one of: `cyan`, `blue`, `red`, `yellow`, `green`, `purple`, `pink`, `orange`, `indigo`
+Every `.md` under `agents/` loads as an agent, so the directory holds agent files only. The agent catalog is the Agents section of `docs/index.md`; `test_every_agents_md_is_an_agent` fails the build on a stray doc.
 
-### `commands/<name>.md`
+### `commands/` (legacy; do not add)
 
-Frontmatter recommended (some existing commands don't have it yet):
-
-- `name` - kebab-case, must match the filename. Claude Code doesn't need it (it uses the filename), but the Claude Desktop / claude.ai skill loader parses a lone uploaded command file as a `SKILL.md` and errors with `missing field 'name' in SKILL.md frontmatter` when it's absent - a single uploaded file has no directory name to fall back on. Include it so a command's `.md` also works when uploaded as a standalone skill.
-- `disable-model-invocation: true` - a command is a manual-only skill by definition, so set this on every command. In Claude Code it's inert (commands are already slash-command-only); when the file is uploaded as a Claude Desktop / claude.ai skill it flips the Trigger from "Slash command + auto" to "Slash command", stopping Claude from auto-firing it off a `description` match.
-- `description` - shown in `/help`
-- `argument-hint` - shown after the command name when typing
-
-Commands without frontmatter still work but provide no `/help` description.
+Claude Code's docs call flat `commands/<name>.md` files the older form of skills. The seven former commands moved to `skills/<name>/SKILL.md` with their invocation names unchanged (https://github.com/bjcoombs/ai-native-toolkit/issues/500). A new slash-command workflow is a user-invoked skill; `test_no_legacy_command_files` fails the build if a `commands/*.md` file reappears.
 
 ## Invariants
 
-- Every plugin listed in `.claude-plugin/marketplace.json` must exist on disk.
-- Every skill auto-discovered from `skills/` must have a valid `SKILL.md`.
-- Commands that orchestrate agents should explicitly reference the agent name. Commands that are pure orchestrators (no subagent invocation) should say so in their body so an agent reading the file isn't confused.
+- Every plugin listed in `.claude-plugin/marketplace.json` exists on disk.
+- Every skill auto-discovered from `skills/` has a valid `SKILL.md`.
+- A user-invoked skill that orchestrates agents names the agent explicitly; a pure orchestrator (no subagent invocation) says so in its body.
+- Relative markdown links resolve. For an illustrative file mention use inline code (`` `CLAUDE.md` ``), not a clickable link.
+- No line-starting git conflict marker in any authored markdown; write a marker as inline code.
+- mypy `strict` with `disallow_any_generics`: no bare `dict` or `list` (use a `TypedDict`; shared run-context and orchestrator file shapes live in `lib/run_context_types.py`), and every `# type: ignore` carries a code.
+- **File-size ratchet.** Python files under `skills/assess/` and `scripts/` stay under 800 lines, or under their `[ceilings]` entry in `.file-size-ratchet.toml`. Split a file rather than raise its ceiling; a ceiling follows its file down.
+- **Coverage floor.** `fail_under` in each package's `pyproject.toml` (93 for `skills/assess`, 91 for `scripts/`) only rises; lowering it needs a stated reason in the PR.
+- `/assess` layering is inward-only: a `lib/` module never imports an orchestrator script (`skills/assess/tests/test_self_architecture.py`). Add a test alongside any change to a deterministic module, and update `skills/assess/scripts/lib/README.md` (the per-module reference and co-change seam map) with it.
+- `instructions_grade` is `Optional[str]`: `null` means no instruction file at any known location, a different remediation from F.
+- **`FLOOR.md` is the constitutional floor.** A change to the floor core (`FLOOR.md`, `scripts/floor_check.py`, `scripts/floor_anchor.py`, `.github/workflows/floor.yml`, per `FLOOR_CORE_PATHS`) needs the maintainer's out-of-band `floor-signoff` approval, which CI requests automatically. No automated step - retro, marathon teammate, or fix loop - may self-apply it or route around it: propose the change and stop. A change to `scripts/contract/` or the canaries must pass `canary suite (semantic layer)` instead.
+- A standalone ZIP is self-contained: no `../<skill>` or `skills/<skill>` path survives the build. New content that names `${CLAUDE_SKILL_DIR}`, `$ARGUMENTS`, an `/ai-native-toolkit:*` command or a Claude Code-only tool needs `chat-skip` / `chat-replace` markers.
 
 ## CI
 
-- `.github/workflows/pr-lint.yml` validates PR titles match conventional-commit format and auto-applies the matching label (`feat` / `fix` / `docs` / `chore` / `refactor`). Other conventional types (`ci`, `build`, `test`, `perf`, `style`, `revert`) pass validation but aren't auto-labelled.
-- `.github/workflows/tests.yml` runs three pytest jobs (`skills/assess pytest`, `scripts/ pytest`, `plugin contract pytest`) plus a `ruff + mypy gates` lint job (Layer 3 complexity ratchet + Layer 2 type gate) on every PR and push to `main`. A red test is a real regression - the deterministic core is reproducible, so flakes shouldn't happen. The `plugin contract pytest` job runs `test_internal_links_resolve` over every shipped `SKILL.md`/command file, so relative markdown links must point to real files - use inline code (`` `CLAUDE.md` ``), not a clickable `[..](./CLAUDE.md)` link, for illustrative file mentions. It also runs `test_no_conflict_markers` over every authored markdown file, so an unresolved git conflict (a line-starting `<<<<<<<` / `>>>>>>>` / `|||||||`) fails the build - markdown has no parser to reject one, which is how `commands/tm.md` shipped for ~3 weeks with three committed conflict regions (#211/#216). Reference a marker illustratively as inline code so it never starts a line. It also runs `test_no_bare_positional_in_skill_md` over every shipped `SKILL.md`, because Claude Code substitutes a skill's arguments into a bare `$1`..`$9` anywhere in the text, fenced or not, which is how the assess skill's `needs_offer` helper ran with argument words as its parameters (#328): write shell positionals in brace form (`${1}`), and for awk, which has no braced field reference, write the parenthesised `$(1)` or restructure the snippet so it takes no positionals.
-- **`main` has branch protection** (`enforce_admins: true`, 0 required approvals): a PR cannot merge unless `skills/assess pytest`, `scripts/ pytest`, `plugin contract pytest`, and `Validate PR title` are green. `CodeRabbit`, `Auto-label from PR title`, and the push-only `build` (standalone publish) job are intentionally **not** required. Emergency override: `gh api -X DELETE repos/bjcoombs/ai-native-toolkit/branches/main/protection`, then re-apply.
-- `.github/release.yml` configures categorised release notes when running `gh release create --generate-notes`. See the file for the label-to-category mapping.
+`main` has branch protection (`enforce_admins: true`, 0 required approvals). Seven checks must be green: `skills/assess pytest`, `scripts/ pytest`, `plugin contract pytest`, `ruff + mypy gates`, `Validate PR title`, `floor enforcement`, `floor self-anchor`. PR titles follow conventional-commit format. CI installs from the committed `uv.lock` files (`uv run --locked`), and the `Lockfiles match pyproject.toml` step fails on a stale one: a dependency edit commits the re-locked `uv.lock` (run `uv lock` in that package). CI runs only on PRs to `main` and pushes to `main`. A red test is a real regression; the core is deterministic.
 
-**CI triggers only on `main`** (`pull_request`/`push` to `main`). A PR targeting `main` gets `tests.yml` + `pr-lint.yml` on every synchronize; pushes to other branches with no open PR don't run them.
+Workflows, lockfiles, the type gate, the ratchet and coverage details, mutation testing, CodeQL and the coverage recipe for `/assess`: `docs/contributing/ci.md`.
 
 ## Marathon Configuration
 
-Project-specific settings the `/tm` and `/issues` commands (and the shared `marathon` skill) read to drive marathon mode. When this section is absent the commands fall back to defaults (base `main`, **1** approval) - which is wrong for this solo repo and would stall every PR, so keep it here.
+Read by `/tm`, `/issues`, `marathon`, `pr-review-merge` and `/fix-pr`. Without it they default to 1 approval, which stalls every PR on this solo repo. Reasoning behind each value: `docs/contributing/marathon.md`.
 
 ### Branch and Merge
 
 - **Base branch**: `main`
 - **PR target branch**: `main`
-- **Required approvals**: 0 - solo-maintainer repo, no second reviewer or approving bot. The lead merges each PR itself at green CI + resolved threads.
+- **Required approvals**: 0 - solo maintainer; the lead merges at green CI + resolved threads.
 - **Markdown-only PR approvals**: 0
 
 ### Bot Reviewers
 
 **CodeRabbit** (`coderabbitai[bot]`):
-- Re-reviews on push: no - on this repo it is rate-limited and its check often reports `null`, so waiting on it would stall every PR; it must never gate merge.
-- Comments only, frequently rate-limited; its check often reports neutral/`null`. It is **not** a required status check and never blocks merge.
-- Fix code and push - CodeRabbit re-reviews and resolves its own threads. **Never reply in CodeRabbit threads** (it ignores replies from other bots).
+- Re-reviews on push: no - rate-limited, check often `null`; never gates merge.
+- Not a required status check. Fix code and push; it resolves its own threads. **Never reply in CodeRabbit threads.**
 
-**claude-review** (`claude[bot]`, the advisory AI review workflow):
+**claude-review** (`claude[bot]`, advisory AI review workflow):
 - Re-reviews on push: yes
-- Max wait for re-review: 20m - the `claude-review` job has `timeout-minutes: 15`, and runs of 9-12m are routine, so 20m keeps the timeout an escape hatch rather than the usual outcome.
+- Max wait for re-review: 20m
 - Re-review check name: claude-review
-- The marathon's hold for the AI review before merging is this setting applied through `pr-review-merge` Ready Criterion 6: the `claude-review` check run on the head SHA has four states. In progress: the lead keeps waiting until the 20m max wait expires. Completed with conclusion `success`: the criterion is satisfied, and the lead confirms the summary's `Commit:` line cites the head before merging on it. Completed with conclusion `skipped`: the reviewer is not applicable to this PR (the workflow skips Dependabot actors by design), so the criterion is satisfied with no warning. Completed with any other conclusion (failure, cancelled, neutral, timed_out): a settled verdict that the reviewer did not complete a green pass, so the lead takes the warning path at once. On expiry or a settled run whose conclusion is neither `success` nor `skipped`, the lead merges with a warning in the merge record naming `claude-review`, the head SHA, the run's conclusion, and whether the reviews endpoint shows a `claude[bot]` review of that head SHA anyway; nothing holds forever on this advisory bot.
+- Merge hold follows `pr-review-merge` Ready Criterion 6's four-state rule on the head SHA: `success` (confirm the `Commit:` line cites the head) or `skipped` satisfies it; any other settled conclusion, or expiry, merges with a warning naming `claude-review`, the head SHA and the conclusion. Never holds forever.
 - Resolve its threads via GraphQL after addressing the feedback.
 
 No human reviewers on this repo.
 
 ### CI Patterns
 
-- **Required (merge-gating) checks**: `skills/assess pytest`, `scripts/ pytest`, `plugin contract pytest`, `Validate PR title` (enforced by branch protection - see the CI section).
-- **Non-blocking checks**: `CodeRabbit` (rate-limited bot), `Auto-label from PR title` (convenience automation), `build` (push-only standalone publish - does not run on PRs), `claude-review` (advisory AI review - posts findings as threads but never gates merge; slow, often finishes after the required checks are green; reports red when the reviewer itself errored, so a green check is evidence the reviewer completed, not that it reviewed the right head - confirm the summary's `Commit:` line matches the head before relying on it; the lead's hold on it before merging follows the four-state rule in the Marathon Configuration's claude-review entry).
-- **`AI-readiness regression gate`**: an `/assess`-based gate that is **effectively required but re-runs on every base advance** (it diffs the PR against `main`). It is not in the classic branch-protection `required_status_checks.contexts`, so it won't show in that API list, but a plain `gh pr merge` is refused while it is re-running. In a multi-PR wave each merge re-triggers it on the still-open PRs - so either wait for it to re-settle per PR, or merge with `--admin` once the four named required checks are green.
-- **Local-run gotcha**: the `skills/assess` pytest suite shows ~7 phantom git-commit failures from global git config when run locally - run with `GIT_CONFIG_GLOBAL=/dev/null` to clear them. They are not CI failures.
-- **Hot file on every PR**: `.claude-plugin/plugin.json` `.version` - each PR must bump it. Assign each teammate its target version explicitly at spawn and merge sequentially (highest version wins); values assigned at spawn are final - if merge order shifts (e.g. an externally-merged PR advances `main`), fix it at merge time by holding or lead-resolving the conflict, never by re-messaging an in-flight teammate. **Identical bumps across parallel PRs are unsafe here**: `build-standalone-skills.yml` publishes an immutable `standalone-skills-v<version>` on the version *change*, so the first merge ships an incomplete bundle and the identical later bumps never re-fire it - have the last-merging PR bump one step higher (or bump once at the end) so the complete tree republishes.
+- **Required (merge-gating) checks**: `skills/assess pytest`, `scripts/ pytest`, `plugin contract pytest`, `ruff + mypy gates`, `Validate PR title`, `floor enforcement`, `floor self-anchor`.
+- **Non-blocking checks**: `CodeRabbit`, `Auto-label from PR title`, `canary suite (semantic layer)`, `canary path filter`, `floor sign-off summary`, `floor sign-off` (gates indirectly via `floor enforcement`), `build`, `mutmut (assess core)`, `CodeQL (python)`, `CodeQL (javascript-typescript)`, `CodeQL (actions)`, `CodeQL`, `pip-audit`, `claude-review` (confirm its `Commit:` line matches the head).
+- **`AI-readiness regression gate`**: effectively required and re-runs on every base advance; not in the branch-protection list, but `gh pr merge` is refused while it runs. Wait for it per PR, or merge with `--admin` once the seven required checks are green.
+- **Hot file on every PR**: `.claude-plugin/plugin.json` `.version`. Assign each teammate its target version at spawn (final) and merge sequentially, highest wins. Never give parallel PRs identical bumps: the last-merging PR bumps one step higher (or the wave bumps once at the end) so the standalone bundle republishes.
 
 ### GitHub Issues (for `/issues`)
 
@@ -128,104 +137,21 @@ No human reviewers on this repo.
 
 ### Retrospective
 
-- **Retro log**: `~/.claude/projects/<project-slug>/memory/marathon-retros.md` - append each marathon's retrospective here after completion. (Path is per-machine; don't commit a resolved absolute path - it leaks a home directory, the exact issue `/assess` now warns about.)
+- **Retro log**: `~/.claude/projects/<project-slug>/memory/marathon-retros.md` - append each marathon's retrospective. Never commit a resolved absolute path.
 
 ### Release after a marathon
 
-As the **final** step, once all of a marathon's PRs are merged and the retrospective is done, cut a GitHub release at the new plugin version so users get the update via `/plugin update` and the standalone-skills publish + categorised release notes fire:
+The final step, once every PR is merged and the retro is done: one GitHub release `v<version>` per marathon, with notes that link the `standalone-skills-v<version>` ZIP bundle, then a manual Marketplace refresh. Commands: `docs/contributing/release.md`.
 
-```bash
-VERSION=$(jq -r '.version' .claude-plugin/plugin.json)
-gh release create "v$VERSION" --generate-notes --title "v$VERSION"
+## Reference
 
-# Prepend a pointer to the standalone ZIP bundle so the README's stable
-# releases/latest link can hand off to that version's downloadable ZIPs.
-# (build-standalone-skills.yml publishes standalone-skills-v$VERSION on the
-# version-bump push, so it exists by the time you cut this release.)
-ZIP_URL="https://github.com/bjcoombs/ai-native-toolkit/releases/tag/standalone-skills-v${VERSION}"
-BODY=$(gh release view "v$VERSION" --json body -q .body)
-gh release edit "v$VERSION" --notes "📦 **Standalone skill ZIPs** (claude.ai, Claude Desktop, Cowork, any Agent-Skills assistant): ${ZIP_URL}
-
-${BODY}"
-```
-
-`.github/release.yml` maps the PR labels (`feat`/`fix`/`docs`/`chore`/`refactor`) to release-note categories, and `build-standalone-skills.yml` republishes the standalone ZIPs on the version bump. The plugin release is marked Latest, so `releases/latest` always resolves to it and its notes link straight to the ZIP bundle. One release per marathon, not one per PR.
-
-When several PRs share one marathon, the standalone build fires on the **first** version-changing merge - so the final merged tree must carry the highest version (have the last-merging PR bump one step higher, per the version hot-file note above), otherwise the published `standalone-skills-v<version>` bundle is missing the later PRs and no further build re-fires for that version.
-
-**Marketplace listing (manual, web-only).** The repo also publishes the [AI-Readiness Assess Gate action](https://github.com/marketplace/actions/ai-readiness-assess-gate). The listing's "latest version" does **not** advance with `gh release create` - no API exists for the Marketplace flag. To refresh it: edit the release in the web UI, tick "Publish this Action to the GitHub Marketplace", update. Do this on marathon releases; consumers are unaffected either way (their `uses:` pins and Dependabot bumps read git tags, not the listing).
-
-## Testing a branch before merging
-
-`/plugin install` only sees `main`. To test an unmerged branch's `SKILL.md` + scripts as a real plugin - or to run the scripts directly against a target repo - see [`docs/testing-a-branch-locally.md`](docs/testing-a-branch-locally.md). Key point: plugin skills reach their bundled scripts through the `${CLAUDE_SKILL_DIR}` token, which Claude Code replaces with the skill's directory in the version cache when it loads the skill text. The substitution is textual: the literal `${CLAUDE_SKILL_DIR}` and `${CLAUDE_PLUGIN_ROOT}` tokens are filled in, but neither is an environment variable in the Bash tool calls a skill makes, so shell-expansion forms such as `${CLAUDE_PLUGIN_ROOT:-...}` see an unset variable. `~/.claude/skills/` holds no plugin skill.
-
-## Standalone skill pipeline
-
-`assess`, `huddle`, `deslop`, `skill-forge`, and `semantic-compress` are also distributed as standalone ZIPs for claude.ai, Claude Desktop, Cowork, and any other Agent-Skills assistant via `Settings → Customize → Skills → Upload Skill`. The set is whatever `SKILLS` in `scripts/standalone_skill_config.py` lists.
-
-**Each ZIP must be self-contained.** A standalone ZIP ships one skill with no siblings, so a plugin-time cross-skill link (`../<other-skill>/...` or `skills/<other-skill>/...`) cannot resolve. Two mechanisms keep ZIPs whole: `bundle_files` vendors a needed file from another skill into the ZIP (e.g. skill-forge vendors `ab-equivalence`'s `runner-prompt.md`, the wrapper its solo mode fills), and the build's link localizer (`transform_skill.localize_cross_skill_links`) rewrites every cross-skill reference - to the local copy if vendored, otherwise degraded to a bare mention. `ab-equivalence` is a **library skill** (composed by skill-forge and semantic-compress, never invoked directly), so it ships **no** standalone ZIP of its own; its files are vendored into the consumer that uses them. `scripts/tests/test_integration.py::test_no_dangling_cross_skill_references` fails the build if any shipped `.md` still carries a `../<skill>`/`skills/<skill>` path - the guardrail that was missing when the ab-equivalence extraction left skill-forge's runner reference dangling.
-
-**Build locally:**
-```bash
-bash scripts/build-standalone-skills.sh            # all skills → dist/standalone-skills/
-bash scripts/build-standalone-skills.sh assess     # one skill
-bash scripts/build-standalone-skills.sh --dest ~/Desktop  # custom output dir
-```
-
-**How it works:** HTML comment markers in source SKILL.md files flag plugin-only content. `scripts/transform_skill.py` strips `<!-- chat-skip:start/end -->` blocks and applies `<!-- chat-replace:key -->` substitutions defined in `scripts/standalone_skill_config.py`. The pipeline is tested via `uv run --with pytest pytest` from `scripts/`.
-
-**Tests:**
-- `scripts/tests/test_transform.py` - unit tests for transformer primitives
-- `scripts/tests/test_integration.py` - full-build ZIP content validation (forbidden strings, expected files)
-- Run: `cd scripts && uv run --with pytest pytest -v`
-
-**CI:** `.github/workflows/build-standalone-skills.yml` triggers on `plugin.json` version bumps and publishes a per-version immutable release tagged `standalone-skills-v<version>` (one create call, no delete - GitHub immutable releases permanently reserve a tag once it has backed a release, so the old rolling `standalone-skills-latest` delete-and-recreate pattern can never succeed again). Users don't browse these directly: the per-marathon plugin release (`v<version>`, marked Latest) carries a link to that version's `standalone-skills-v<version>` bundle in its notes, so the README points at `releases/latest` and the release page hands off to the ZIP tag (see "Release after a marathon"). `.github/workflows/tests.yml` now runs both the `skills/assess/` suite and the `scripts/` suite on every PR and push.
-
-**Marker rules:**
-- `<!-- chat-skip:start/end -->` - wraps content to remove entirely (plugin path resolution, `$ARGUMENTS`, agent-orchestration infrastructure, namespaced slash commands)
-- `<!-- chat-replace:key -->` + next line - replaces one line with the standalone text defined in `standalone_skill_config.py`
-- Apply markers to ALL `.md` files in the skill directory, not just `SKILL.md` - reference files with plugin-specific content will leak into the ZIP if unmarked
-- Markers must be balanced; keep them at line start (the transformer handles indented markers via `.strip()`, but line-start is cleaner)
-- Run `cd scripts && uv run --with pytest pytest -v` to validate after any marker changes
-
-**When to add markers:** any new skill content that references `${CLAUDE_SKILL_DIR}`, `$ARGUMENTS`, a namespaced slash command (`/ai-native-toolkit:*`), or a Claude Code-only tool (`Agent`, `SendMessage`, a `run_in_background` teammate spawn).
-
-## /assess architecture
-
-Deterministic core in `skills/assess/scripts/lib/` does all data work; the LLM only writes prose. The layering is **inward-only**: a `lib/` module may import other `lib/` modules and third-party libraries, but never an orchestrator script (`assess_core.py`, `assess_finalize.py`, `assess_report.py`, `assess_gate.py`, ...). This keeps the core independently testable and reusable. It is no longer just a convention - `skills/assess/tests/test_self_architecture.py` enforces it as a contract: an `ast` scan fails the build if any `lib/` module imports an orchestrator (the forbidden set is derived from disk, so a new orchestrator is covered automatically).
-
-- `lib/agent_instructions_grader.py` - heuristic scoring of CLAUDE.md / AGENTS.md / GEMINI.md / .cursorrules / .github/copilot-instructions.md (regex + arithmetic, no AI)
-- `lib/stats_diff.py` - cross-run comparison (graduated/regressed/new/persistent hotspots)
-- `lib/wiki_writer.py` - renders `index.md`, `log.md`, `hotspots/*.md` from templates
-- `lib/anomaly_detector.py` - flags suspicious run results for self-feedback
-- `scripts/assess_core.py` - orchestrator; writes `run-context.json` for the LLM to read
-- `scripts/assess_finalize.py` - LLM write-back; reads `.assess/finalize-input.json` and replaces deterministic-core placeholders in `log.md` and `hotspots/*.md` with the LLM-derived score and per-file actions.
-
-Tests live in `skills/assess/tests/` and run via `uv run --with pytest pytest`. Add a test alongside any change to a deterministic module - that's the contract that lets us trust the output regardless of which LLM is driving.
-
-`skills/assess/scripts/lib/README.md` is the per-module reference and the home of the **co-change seam map**: it names the directories that move together by design (the core <-> lib seam, each lib module <-> its test, and the standalone build <-> the skills it packages) so the historical coupling `/assess` flags on this repo reads as owned cohesion, not entanglement. Update it alongside any change to a `lib/` module so it never becomes a lying map of its own.
-
-The `.assess/` directory in a target repo is a compounding wiki:
-
-- `assess-report.md` - latest prose-heavy summary (LLM-written)
-- `complexity-stats.json` + `.prior.json` - current and previous run sidecars
-- `complexity-heatmap.svg` - current treemap
-- `run-context.json` - structured data the LLM uses for prose
-- `index.md` - catalog of every hotspot ever flagged (deterministic)
-- `log.md` - append-only run history (deterministic)
-- `hotspots/<slug>.md` - per-file persistent page (deterministic)
-
-Each `/assess` run reads the prior state from this directory and adds to it. Hotspots that leave the top list graduate. The wiki is the value, not any single snapshot.
-
-**The LLM write-back pattern.** The deterministic core writes log/hotspot files with placeholders. After the LLM derives the score, top action, and per-hotspot suggestions, it writes `.assess/finalize-input.json` and invokes `assess_finalize.py` to replace the placeholders in place. This keeps the deterministic core ignorant of LLM-derived content while still producing a wiki where every value is filled.
-
-**Schema convention.** `instructions_grade` is `Optional[str]` - `null` means no instruction file was found at any known location (different remediation from F). The Layer 0 scoring rule in `SKILL.md` distinguishes these cases.
-
-## What this repo doesn't have (and that's fine)
-
-- Test coverage focused on the deterministic core under `skills/assess/`. `complexity-treemap.py` is still smoke-tested rather than unit-tested - it's a thin CLI wrapper around lizard/squarify.
-- No coverage gates - same reason.
-
-## Compatibility
+- North star in full: `docs/contributing/north-star.md`
+- CI, gates, coverage, mutation, CodeQL: `docs/contributing/ci.md`
+- Marathon settings explained: `docs/contributing/marathon.md`
+- Releasing: `docs/contributing/release.md`
+- Standalone skill pipeline (markers, vendoring, build): `docs/contributing/standalone-skills.md`
+- `/assess` architecture and the `.assess/` wiki: `docs/contributing/assess-architecture.md`
+- Testing an unmerged branch as a real plugin (`/plugin install` only sees `main`), and how `${CLAUDE_SKILL_DIR}` substitution works: `docs/testing-a-branch-locally.md`
+- Every shipped doc: `docs/index.md`
 
 Recognised by Claude Code as `CLAUDE.md`. For Codex (`AGENTS.md`) or Gemini CLI (`GEMINI.md`), copy or symlink under those names.

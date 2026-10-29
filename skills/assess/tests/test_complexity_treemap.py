@@ -326,8 +326,8 @@ def test_effective_ccn_collapses_to_aggregate_without_per_function_data(treemap)
 def test_assess_dir_is_self_excluded_by_default(treemap):
     """A prior run's run-context.json must not be scored on the next run -
     the script's own output directory is in EXCLUDE_DIRS. Otherwise re-runs
-    pollute the heatmap with their own past output (issue #50 bonus)."""
-    assert ".assess" in treemap.EXCLUDE_DIRS
+    pollute the heatmap with their own past output (#50); so does mutants/."""
+    assert {".assess", "mutants"} <= treemap.EXCLUDE_DIRS
 
 
 def test_is_user_excluded_matches_dir_name(treemap):
@@ -828,12 +828,12 @@ def test_write_svg_tooltip_shows_est_tokens_and_loc(render_lib, tmp_path):
 def test_artifact_schema_version_mirrors_assess_core(treemap):
     """One /assess run stamps one provenance schema version on every artifact it
     writes. The treemap runs as its own process and duplicates the constant
-    rather than importing assess_core, so this is what keeps the copy honest:
+    rather than importing lib.artifact_schema, so this is what keeps the copy honest:
     bump one without the other and complexity-stats.json disagrees with
     run-context.json about which run envelope it carries."""
-    import assess_core
+    from lib import artifact_schema
 
-    assert treemap.ARTIFACT_SCHEMA_VERSION == assess_core.ARTIFACT_SCHEMA_VERSION
+    assert treemap.ARTIFACT_SCHEMA_VERSION == artifact_schema.ARTIFACT_SCHEMA_VERSION
 
 
 def test_write_stats_stamps_run_id_and_schema_version(treemap, tmp_path):
@@ -846,7 +846,7 @@ def test_write_stats_stamps_run_id_and_schema_version(treemap, tmp_path):
     out = root / "stats.json"
     treemap.write_stats([(f, 100, 5.0, "lizard")], None, None, root, out)
     stats = json.loads(out.read_text())
-    assert stats["artifact_schema_version"] == treemap.ARTIFACT_SCHEMA_VERSION == "1.3.0"
+    assert stats["artifact_schema_version"] == treemap.ARTIFACT_SCHEMA_VERSION == "1.4.0"
     # The stats-layout schema_version (from #244) still coexists as an int.
     assert stats["schema_version"] == treemap.STATS_SCHEMA_VERSION
     run_id = stats["run_id"]
@@ -955,7 +955,7 @@ def test_write_stats_paths_match_generated_header_list_separator(treemap, tmp_pa
     paths = [r["path"] for r in json.loads(out.read_text())["top_large"]]
     assert paths == ["db/a.py"]
     src = (Path(treemap.__file__)).read_text()
-    rel_body = src[src.index("    def rel(p: Path) -> str:"):][:400]
+    rel_body = src[src.index("def _rel_path(p: Path, root: Path) -> str:"):][:400]
     assert "as_posix()" in rel_body and "str(p" not in rel_body
 
 
@@ -1307,9 +1307,9 @@ def test_write_stats_dart_scanner_marked_approximate(treemap, tmp_path):
 def test_write_stats_version_keys_are_tool_versions_or_listed_non_tools(
         treemap, tmp_path, monkeypatch):
     """Every `*_version` key write_stats emits is either a tool version that
-    assess_core._stats_tool_versions reads or a stamp listed in
+    diff_reliability.stats_tool_versions reads or a stamp listed in
     _NON_TOOL_VERSION_KEYS, so the writer and the reader cannot drift."""
-    import assess_core
+    from lib import diff_reliability
 
     monkeypatch.setattr(treemap, "_scc_version", lambda: "3.7.0")
     root = tmp_path
@@ -1323,9 +1323,9 @@ def test_write_stats_version_keys_are_tool_versions_or_listed_non_tools(
     )
     stats = json.loads(out.read_text())
     version_keys = {k for k in stats if k.endswith("_version")}
-    tools = {f"{t}_version" for t in assess_core._stats_tool_versions(stats)}
+    tools = {f"{t}_version" for t in diff_reliability.stats_tool_versions(stats)}
     assert tools == {"lizard_version", "scc_version"}
-    assert version_keys - tools == set(assess_core._NON_TOOL_VERSION_KEYS)
+    assert version_keys - tools == set(diff_reliability._NON_TOOL_VERSION_KEYS)
 
 
 def test_collect_dart_scanner_skips_files_with_no_function(
@@ -1556,3 +1556,243 @@ def test_largest_first_keeps_size_order_where_sizes_differ(treemap, tmp_path):
 
     picked = treemap._largest_first(rows, lambda f: tokens.get(f[0], f[1]), 3)
     assert [f[0].name for f in picked] == ["zz.json", "b1.json", "b10.json"]
+
+
+def test_write_stats_distribution_blocks_pin_percentiles_and_totals(
+        treemap, tmp_path):
+    """Characterise every distribution block write_stats emits: p50/p95/max
+    (numpy's linear interpolation) and totals for loc, est_tokens, ccn,
+    fn_ccn and churn, plus scoring_coverage. Pins the arithmetic before
+    the function is split into helpers."""
+    a, b, c = tmp_path / "a.py", tmp_path / "b.py", tmp_path / "c.ex"
+    files = [(a, 10, 2.0, "lizard"), (b, 30, 8.0, "lizard"),
+             (c, 50, 20.0, "scc")]
+    tokens = {a: 100, b: 300, c: 500}
+    out = tmp_path / "stats.json"
+    treemap.write_stats(
+        files, {a: 1, b: 3}, "commits (last 12mo)", tmp_path, out,
+        fn_ccn_by_path={a: [1.0, 1.0], b: [2.0, 6.0]},
+        tokens_by_path=tokens)
+    # The numpy stub breaks pytest.approx, so round instead.
+    stats = json.loads(out.read_text(),
+                       parse_float=lambda v: round(float(v), 9))
+    assert stats["files_scored"] == 3
+    assert stats["scoring_coverage"] == {"lizard": 2, "scc": 1}
+    assert stats["loc"] == {"p50": 30.0, "p95": 48.0, "max": 50.0,
+                            "max_code": 50.0, "max_data": 0.0, "total": 90}
+    tok = dict(stats["est_tokens"])
+    budget = tok.pop("budget")
+    assert tok == {"p50": 300.0, "p95": 480.0, "max": 500.0,
+                   "max_code": 500.0, "max_data": 0.0, "total": 900}
+    assert budget["total"] == 900
+    assert budget["files_over_budget"] == 0
+    assert stats["ccn"] == {"basis": "file-aggregate", "p50": 8.0,
+                            "p95": 18.8, "max": 20.0}
+    fn = stats["fn_ccn"]
+    assert fn["source"] == [{"name": "lizard", "approximate": False}]
+    assert fn["function_count"] == 4
+    assert (fn["p50"], fn["p95"], fn["max"]) == (1.5, 5.4, 6.0)
+    # c.ex has no churn entry, so it counts as 0 commits.
+    assert stats["churn"] == {"p50": 1.0, "p95": 2.8,
+                              "max": 3.0}
+    assert [r["path"] for r in stats["top_large"]] == ["c.ex", "b.py", "a.py"]
+    rows = {r["path"]: r for r in stats["top_large"]}
+    assert rows["c.ex"]["commits"] == 0
+    assert rows["c.ex"]["max_fn_ccn"] is None
+    assert rows["b.py"]["max_fn_ccn"] == 6.0
+    assert "_score" not in rows["a.py"]
+
+
+def test_write_stats_empty_file_list_reports_zeroes(treemap, tmp_path):
+    """No scored files: every distribution reads 0 and every top list is empty,
+    rather than raising on max() of an empty sequence."""
+    out = tmp_path / "stats.json"
+    treemap.write_stats([], None, None, tmp_path, out)
+    stats = json.loads(out.read_text())
+    assert stats["files_scored"] == 0
+    assert stats["loc"]["max"] == stats["loc"]["p95"] == 0.0
+    assert stats["ccn"]["max"] == 0.0
+    assert stats["fn_ccn"]["function_count"] == 0
+    assert stats["fn_ccn"]["source"] == []
+    assert stats["fn_ccn"]["backend_by_language"] == {}
+    assert stats["churn"] is None
+    assert stats["top_hotspots"] == stats["top_complex"] == []
+
+
+# --- Characterization: render's console summary and main's CLI paths -------
+# Pin the branches of `render` and `main` so splitting them into named steps
+# cannot change what they print, pass on, or reject.
+
+
+def _stub_render_io(treemap, monkeypatch):
+    """Stub the colour map, squarify layout and SVG writer; capture writer args."""
+    captured: dict = {}
+    monkeypatch.setattr(treemap.plt, "get_cmap",
+                        lambda _name: (lambda v: (1.0, 1.0 - v, 0.0, 1.0)), raising=False)
+    monkeypatch.setattr(treemap, "layout", lambda *a, **k: None)
+
+    def fake_write_svg(rects, root, W, H, out_path, show_labels, metric_label,
+                       show_survivor_legend=False):
+        captured.update(show_labels=show_labels, metric_label=metric_label,
+                        show_survivor_legend=show_survivor_legend)
+
+    monkeypatch.setattr(treemap, "write_svg", fake_write_svg)
+    return captured
+
+
+def _two_files(tmp_path):
+    a = tmp_path / "a.py"
+    a.write_text("x = 1\n" * 40, encoding="utf-8")
+    b = tmp_path / "b.py"
+    b.write_text("y = 2\n" * 4, encoding="utf-8")
+    return [(a, 40, 12.0, "lizard"), (b, 4, 3.0, "scc")]
+
+
+def test_render_prints_hue_saturation_and_biggest_files(treemap, tmp_path, monkeypatch, capsys):
+    captured = _stub_render_io(treemap, monkeypatch)
+    files = _two_files(tmp_path)
+    aux = {files[0][0]: 7, files[1][0]: 1}
+    treemap.render(files, tmp_path, tmp_path / "o.svg", "t", show_labels=True,
+                   aux_data=aux, aux_label="commits (last 12mo)",
+                   survivor_density={files[0][0]: 0.6})
+    out = capsys.readouterr().out
+    assert "(2 files, 1 lizard, 1 scc)" in out
+    assert "hue: ccn; range 0-12; cap 12 (max)" in out
+    assert "saturation: commits (last 12mo); range 0-7; cap 7 (max)" in out
+    assert "biggest files (estimated tokens dominate layout):" in out
+    assert "commits (last 12mo)    7  [lizard]  a.py" in out
+    assert captured == {"show_labels": True, "metric_label": "ccn",
+                        "show_survivor_legend": True}
+
+
+def test_render_degenerate_churn_drops_saturation(treemap, tmp_path, monkeypatch, capsys):
+    captured = _stub_render_io(treemap, monkeypatch)
+    files = _two_files(tmp_path)
+    aux = {files[0][0]: 1, files[1][0]: 1}
+    treemap.render(files, tmp_path, tmp_path / "o.svg", "t", by="churn",
+                   aux_data=aux, aux_label="commits", churn_degenerate=True)
+    out = capsys.readouterr().out
+    assert "hue: commits;" in out
+    assert "saturation: churn signal flat" in out
+    assert "saturation: commits;" not in out
+    # The aux column is dropped from the biggest-files list with the axis.
+    rows = [ln for ln in out.splitlines() if "est.tok" in ln]
+    assert len(rows) == 2
+    assert all(row.count("commits") == 1 for row in rows)
+    assert captured["show_survivor_legend"] is False
+
+
+def test_main_rejects_non_directory(treemap, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(sys, "argv", ["complexity-treemap.py", str(tmp_path / "nope")])
+    assert treemap.main() == 1
+    assert "is not a directory" in capsys.readouterr().err
+
+
+def test_main_rejects_missing_scope(treemap, monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(sys, "argv",
+                        ["complexity-treemap.py", str(tmp_path), "--scope", "absent"])
+    assert treemap.main() == 1
+    assert "error: scope path" in capsys.readouterr().err
+
+
+def test_main_rejects_scope_outside_root(treemap, monkeypatch, tmp_path, capsys):
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(sys, "argv",
+                        ["complexity-treemap.py", str(root), "--scope", str(tmp_path)])
+    assert treemap.main() == 1
+    assert "is not under" in capsys.readouterr().err
+
+
+def test_main_no_files_under_scope_names_it(treemap, monkeypatch, tmp_path, capsys):
+    (tmp_path / "sub").mkdir()
+    monkeypatch.setattr(treemap, "collect",
+                        lambda *a, **k: ([], "complexity", None, None, {}))
+    monkeypatch.setattr(sys, "argv",
+                        ["complexity-treemap.py", str(tmp_path), "--scope", "sub"])
+    assert treemap.main() == 1
+    err = capsys.readouterr().err
+    assert "no scoreable files found under" in err
+    assert "excluded as generated" not in err
+
+
+@pytest.mark.parametrize("scope, out_name, title_suffix", [
+    (None, "hotspot-{root}.svg", ""),
+    ("sub/deep", "hotspot-{root}-sub-deep.svg", "/sub/deep"),
+])
+def test_main_threads_scope_into_output_name_title_and_stats(
+        treemap, monkeypatch, tmp_path, scope, out_name, title_suffix):
+    root = tmp_path / "repo"
+    (root / "sub" / "deep").mkdir(parents=True)
+    files = _two_files(root)
+    aux = {files[0][0]: 3, files[1][0]: 1}
+    seen: dict = {}
+    monkeypatch.setattr(treemap, "collect",
+                        lambda *a, **k: (files, "hotspot", aux, "commits", {"fn": 1}))
+    monkeypatch.setattr(treemap, "render",
+                        lambda f, r, out, title, **k: seen.update(out=out, title=title, **k))
+    monkeypatch.setattr(treemap, "write_stats",
+                        lambda *a, **k: seen.update(stats_path=a[4], stats_kwargs=k))
+    monkeypatch.chdir(tmp_path)
+    argv = ["complexity-treemap.py", str(root), "--labels", "--stats", "s.json"]
+    if scope:
+        argv += ["--scope", scope]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert treemap.main() == 0
+    assert seen["out"] == Path(out_name.format(root=root.name))
+    assert seen["title"] == f"Hotspot: {root.name}{title_suffix}"
+    assert seen["show_labels"] is True
+    assert seen["by"] == "hotspot"
+    assert seen["aux_data"] is aux
+    assert seen["survivor_density"] == {}
+    assert seen["churn_degenerate"] is False
+    assert seen["stats_path"] == Path("s.json")
+    assert seen["stats_kwargs"]["fn_ccn_by_path"] == {"fn": 1}
+    assert seen["stats_kwargs"]["tokens_by_path"] is seen["tokens_by_path"]
+
+
+@pytest.mark.parametrize("n, expected", [
+    (0, "files"), (1, "file"), (2, "files"),
+])
+def test_plural_agrees_with_count(render_lib, n, expected):
+    assert render_lib.plural(n, "file") == expected
+
+
+@pytest.mark.parametrize("n", [0.6, 1.0, True])
+def test_plural_rejects_a_non_int_count(render_lib, n):
+    """A float can print as "1" yet compare unequal to 1, so plural() takes the
+    rounded int the caller displays and refuses anything else."""
+    with pytest.raises(TypeError):
+        render_lib.plural(n, "line")
+
+
+def test_plural_takes_an_irregular_form(render_lib):
+    assert render_lib.plural(2, "child", "children") == "children"
+    assert render_lib.plural(1, "child", "children") == "child"
+
+
+@pytest.mark.parametrize("tokens, text", [
+    (1, "1 est. token · 100 loc"),
+    (1200, "1,200 est. tokens · 100 loc"),
+])
+def test_write_svg_token_tooltip_and_label_pluralise(render_lib, tmp_path, tokens, text):
+    """The est-token count in the tooltip and the on-block label agrees with
+    its number."""
+    node = render_lib.Node(name="a.py", rel_path="a.py", loc=100,
+                           metric=5.0, color=(0.8, 0.2, 0.1, 1.0),
+                           is_file=True, est_tokens=tokens)
+    rects = [(0.0, 0.0, 1600.0, 1000.0, node)]
+    out = tmp_path / "tok.svg"
+    render_lib.write_svg(rects, Path("/repo"), 1600.0, 1000.0, out, True, "ccn")
+    svg = out.read_text()
+    assert text in svg
+    label = text.split(" · ")[0]
+    assert f">{label}</text>" in svg
+    assert "—" not in svg
+
+
+def test_render_summary_singular_file(treemap, tmp_path, monkeypatch, capsys):
+    _stub_render_io(treemap, monkeypatch)
+    files = _two_files(tmp_path)[:1]
+    treemap.render(files, tmp_path, tmp_path / "o.svg", "t")
+    assert "(1 file, 1 lizard, 0 scc)" in capsys.readouterr().out

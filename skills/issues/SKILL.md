@@ -2,7 +2,7 @@
 name: issues
 disable-model-invocation: true
 description: GitHub-issue marathon - triage open issues, then run agent-ready ones to merge with Agent Teams
-argument-hint: [scope-label] (optional - narrows which open issues are considered; default: all open issues)
+argument-hint: "[scope-label] (optional - narrows which open issues are considered; default: all open issues)"
 ---
 
 <!-- floor:cold-verify-completion -->
@@ -107,7 +107,7 @@ Before any question reaches a human, research it. For each issue whose scope, ac
 criteria, or intent is unclear, run an understand-style pass over what the ambiguity
 touches: the code and tests, open and merged PRs (`gh pr list --state all --search
 "<terms>"`), and the issue history (linked, referenced, and closed issues). The primitive is
-the `/understand` command (`commands/understand.md`, relative to the plugin root): define the
+the `/understand` skill (`skills/understand/SKILL.md`, relative to the plugin root): define the
 terms, separate the explicit need from the implicit one, and bound the scope, grounded in
 what the repository shows. Spawn one research subagent per ambiguous issue (or per subsystem
 for a wide one) so the pass runs in parallel.
@@ -252,7 +252,7 @@ decomposition is approved and created.
 Tagged agent-ready: #12, #15, #18
 Tagged needs-triage:
 - #20, #21: research posted (Needs your call: 1 each)
-- #22: overlaps open PR #40 (both edit commands/issues.md); after it merges: <what remains>
+- #22: overlaps open PR #40 (both edit skills/issues/SKILL.md); after it merges: <what remains>
 Promoted on confirmation: #19 (reading A folded into the issue body)
 
 Sizing:
@@ -273,7 +273,7 @@ Execution order:
   After children merge: #30 parent verification
 
 Overlaps:
-- #22 <-> PR #40: commands/issues.md (held as needs-triage)
+- #22 <-> PR #40: skills/issues/SKILL.md (held as needs-triage)
 - #12 <-> #15: README.md (additive, left parallel)
 
 Approve the decomposition of #30 and the execution order? Reply to proceed (this creates the
@@ -298,7 +298,7 @@ around the contract, so `/issues` carries the same obligation. The run identifie
 is the issue-queue identifier - the label/milestone slug for this queue, e.g.
 `issues-<label>` (`issues-agent-ready` when no scope filter narrows it).
 
-The contract scripts live in the plugin package (`${CLAUDE_PLUGIN_ROOT}/scripts/contract/`), while the contract artifacts (contract, kill test, completion record) live in the target repository's `.taskmaster/contract/`, the scripts' default `--contract-dir`. When `CLAUDE_PLUGIN_ROOT` is unset (a hand-placed checkout rather than an installed plugin) the guard line before each invocation falls back to the current checkout.
+The contract scripts live in the plugin package (`${CLAUDE_PLUGIN_ROOT}/scripts/contract/`), while the contract artifacts (contract, kill test, completion record) live in the target repository's `.claude/contracts/` by default. Every contract script resolves the folder the same way: its `--contract-dir` flag, then the `ACCEPTANCE_CONTRACT_DIR` environment variable, then the default, so setting the variable once moves the folder for the whole run. A repo that already keeps its contracts in `.taskmaster/contract/` and has no `.claude/contracts/` keeps using `.taskmaster/contract/`. When the agent cannot write under `.claude/` without a permission prompt, set `ACCEPTANCE_CONTRACT_DIR` to a folder it can write to. When `CLAUDE_PLUGIN_ROOT` is unset (a hand-placed checkout rather than an installed plugin) the guard line before each invocation falls back to the current checkout.
 
 ```bash
 : "${CLAUDE_PLUGIN_ROOT:=.}"   # unset outside an installed plugin: fall back to the current checkout

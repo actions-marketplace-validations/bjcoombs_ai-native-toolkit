@@ -15,6 +15,7 @@ from __future__ import annotations
 import html
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -22,12 +23,19 @@ import numpy as np
 # helpers (rgba_to_hex / blend_to_grey / adaptive_cap) - e.g. the doc-graph
 # renderer - don't have to depend on it.
 
+# An RGB(A) fill in 0-1 floats. Matplotlib colormaps return four channels;
+# ``blend_to_grey`` returns three plus a fixed alpha, so the length is open.
+Rgba = tuple[float, ...]
+
+# One coloured treemap input row: (path, size, metric, source, rgba fill).
+ColoredFile = tuple[Path, int, float, str, Rgba]
+
 
 @dataclass
 class Node:
     name: str
     size: int = 0
-    color: tuple = (0.5, 0.5, 0.5, 1.0)
+    color: Rgba = (0.5, 0.5, 0.5, 1.0)
     loc: int = 0
     # Estimated token count (chars/4). The code heatmap sizes blocks by this so
     # the layout reflects context-window burden, not line count; ``loc`` stays
@@ -52,10 +60,14 @@ class Node:
     hatch: str = ""
 
 
-def build_tree(files_with_color, root: Path,
+# One placed treemap block: (x, y, width, height, leaf node).
+Rect = tuple[float, float, float, float, Node]
+
+
+def build_tree(files_with_color: list[ColoredFile], root: Path,
                aux_data: dict[Path, int] | None = None,
                aux_label: str = "",
-               node_overrides: dict[Path, dict] | None = None,
+               node_overrides: dict[Path, dict[str, Any]] | None = None,
                size_by: dict[Path, int] | None = None) -> Node:
     """Build the directory tree of Nodes. `files_with_color` is a list of
     (path, size, metric, source, color). `node_overrides` optionally maps a
@@ -106,7 +118,7 @@ def build_tree(files_with_color, root: Path,
 
 
 def layout(node: Node, x: float, y: float, w: float, h: float,
-           out: list) -> None:
+           out: list[Rect]) -> None:
     import squarify
     if node.is_file:
         out.append((x, y, w, h, node))
@@ -122,7 +134,7 @@ def layout(node: Node, x: float, y: float, w: float, h: float,
         layout(child, r["x"], r["y"], r["dx"], r["dy"], out)
 
 
-def rgba_to_hex(rgba: tuple) -> str:
+def rgba_to_hex(rgba: Rgba) -> str:
     r, g, b = rgba[0], rgba[1], rgba[2]
     return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
@@ -130,7 +142,7 @@ def rgba_to_hex(rgba: tuple) -> str:
 GREY = (0.82, 0.82, 0.84)  # cool light grey for "stable" / no recent churn
 
 
-def blend_to_grey(rgba: tuple, factor: float) -> tuple:
+def blend_to_grey(rgba: Rgba, factor: float) -> Rgba:
     """factor=0 returns full grey, factor=1 returns the original colour."""
     factor = max(0.0, min(1.0, factor))
     return tuple(
@@ -210,6 +222,21 @@ def _survivor_legend_parts(W: float, H: float) -> list[str]:
     return parts
 
 
+def plural(n: int, singular: str, plural_form: str | None = None) -> str:
+    """The noun for a count of ``n``: ``singular`` when ``n`` is 1, else the
+    plural (``singular + "s"`` unless ``plural_form`` is given).
+
+    Returns the word only, so each caller keeps its own number formatting
+    (``f"{n:,} {plural(n, 'token')}"``). ``n`` is an ``int`` so the noun agrees
+    with the number shown: a caller holding a float rounds it first and prints
+    the rounded value, and mypy rejects a raw float."""
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise TypeError(f"plural() takes an int count, got {type(n).__name__}")
+    if n == 1:
+        return singular
+    return plural_form if plural_form is not None else singular + "s"
+
+
 # Default accessible name/description for the code heatmap. Passed as the root
 # <svg>'s <title>/<desc> (a11y metadata) so a screen reader announces what the
 # image is and how its channels encode; kept as defaults on write_svg so a
@@ -221,7 +248,34 @@ DEFAULT_SVG_DESC = (
 )
 
 
-def write_svg(rects: list, root: Path, W: float, H: float,
+def _token_text(est_tokens: int) -> str:
+    return f"{est_tokens:,} est. {plural(est_tokens, 'token')}"
+
+
+def _tooltip_line2(node: Node, metric_label: str) -> str:
+    """The stats line under a block's path in its hover tooltip."""
+    if node.tooltip2:
+        return node.tooltip2
+    line2 = f"{node.loc} loc · {metric_label} {node.metric:.0f}"
+    if node.est_tokens:
+        # Code heatmap: block area is estimated tokens, so lead with that and
+        # keep the familiar LOC one hover away (PRD: nothing lost).
+        line2 = f"{_token_text(node.est_tokens)} · {line2}"
+    if node.aux_label:
+        line2 += f" · {node.aux_label} {node.aux_metric:.0f}"
+    return line2
+
+
+def _label_size_text(node: Node) -> str:
+    """The size line of a block's on-canvas label."""
+    if node.label_size_text:
+        return node.label_size_text
+    if node.est_tokens:
+        return _token_text(node.est_tokens)
+    return f"{node.loc} loc"
+
+
+def write_svg(rects: list[Rect], root: Path, W: float, H: float,
               out_path: Path, show_labels: bool,
               metric_label: str,
               show_survivor_legend: bool = False,
@@ -240,12 +294,18 @@ def write_svg(rects: list, root: Path, W: float, H: float,
         # image an accessible name and description (SVG accessibility contract).
         f'<title>{html.escape(svg_title)}</title>',
         f'<desc>{html.escape(svg_desc)}</desc>',
+        # A stylesheet rule beats an SVG presentation attribute, so a bare
+        # `text { text-anchor: middle }` would centre the left-anchored legend
+        # and turn every grey label black. Each default that some <text> also
+        # sets as an attribute is guarded with :not([attr]) so it applies
+        # only where the attribute is absent.
         '<style>',
         '  rect:hover { stroke: #000; stroke-width: 1.5; }',
         '  text { font-family: -apple-system, BlinkMacSystemFont, '
-        '"Segoe UI", sans-serif; fill: #1a1a1a; '
-        'pointer-events: none; text-anchor: middle; '
-        'dominant-baseline: middle; }',
+        '"Segoe UI", sans-serif; '
+        'pointer-events: none; dominant-baseline: middle; }',
+        '  text:not([fill]) { fill: #1a1a1a; }',
+        '  text:not([text-anchor]) { text-anchor: middle; }',
         '</style>',
     ]
     if has_hatch or show_survivor_legend:
@@ -253,19 +313,7 @@ def write_svg(rects: list, root: Path, W: float, H: float,
 
     for x, y, w, h, node in rects:
         rel = node.rel_path or node.name
-        if node.tooltip2:
-            line2 = node.tooltip2
-        elif node.est_tokens:
-            # Code heatmap: block area is estimated tokens, so lead with that
-            # and keep the familiar LOC one hover away (PRD: nothing lost).
-            line2 = (f"{node.est_tokens:,} est. tokens · {node.loc} loc "
-                     f"· {metric_label} {node.metric:.0f}")
-            if node.aux_label:
-                line2 += f" · {node.aux_label} {node.aux_metric:.0f}"
-        else:
-            line2 = f"{node.loc} loc · {metric_label} {node.metric:.0f}"
-            if node.aux_label:
-                line2 += f" · {node.aux_label} {node.aux_metric:.0f}"
+        line2 = _tooltip_line2(node, metric_label)
         tooltip = html.escape(f"{rel}\n{line2}", quote=False)
         parts.append(
             f'<rect x="{x:.2f}" y="{y:.2f}" '
@@ -294,12 +342,7 @@ def write_svg(rects: list, root: Path, W: float, H: float,
             fs = max(7, min(int(min(w, h) / 6), 18))
             cx, cy = x + w / 2, y + h / 2
             name = html.escape(node.name)
-            if node.label_size_text:
-                size_text = node.label_size_text
-            elif node.est_tokens:
-                size_text = f"{node.est_tokens:,} est. tokens"
-            else:
-                size_text = f"{node.loc} loc"
+            size_text = _label_size_text(node)
             metric_text = node.label_metric_text or f"{metric_label} {node.metric:.0f}"
             parts.append(
                 f'<text x="{cx:.1f}" y="{cy - fs:.1f}" '

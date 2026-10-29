@@ -1,6 +1,6 @@
 # Skills
 
-The plugin's skills, auto-discovered by Claude Code from each `<name>/SKILL.md`. Each `SKILL.md` is its subtree's base doc and carries the frontmatter contract (`name`, `description` with a `TRIGGER` clause) documented in [`CLAUDE.md`](../CLAUDE.md). Bundled executables live under `<name>/scripts/`, reference docs under `<name>/references/`. Back to the [Map of Content](../docs/index.md).
+The plugin's skills, auto-discovered by Claude Code from each `<name>/SKILL.md`. Each `SKILL.md` is its subtree's base doc and carries the frontmatter contract (`name`, plus a `description` with a `TRIGGER` clause, or `disable-model-invocation: true` for a user-invoked skill) documented in [`CLAUDE.md`](../CLAUDE.md). Bundled executables live under `<name>/scripts/`, reference docs under `<name>/references/`. Back to the [Map of Content](../docs/index.md).
 
 ## Portable
 
@@ -11,9 +11,40 @@ Work in any Claude Code session, and are also distributed as standalone ZIPs for
 | `/assess` | [`assess/SKILL.md`](./assess/SKILL.md) | Layered AI-readiness assessment (0-8 contract model) plus a complexity hotspot SVG and a doc-navigability graph SVG |
 | `/huddle` | [`huddle/SKILL.md`](./huddle/SKILL.md) | Multi-perspective deliberation using Six Thinking Hats with Fibonacci team sizing |
 | `/deslop` | [`deslop/SKILL.md`](./deslop/SKILL.md) | Detect and remove the telltale signs of AI writing; ships a [`references/full-checklist.md`](./deslop/references/full-checklist.md) |
-| `/ghsync` | [`ghsync/SKILL.md`](./ghsync/SKILL.md) | Bulk-clone and fast-forward sync every GitHub repo you can access across an org |
 | `/skill-forge` | [`skill-forge/SKILL.md`](./skill-forge/SKILL.md) | Harden a skill through judge-panel refinement rounds to a 3-tier promotion gate; refined through its own process |
-| `/semantic-compress` | [`semantic-compress/SKILL.md`](./semantic-compress/SKILL.md) | Optimize LLM-directed instructions while preserving behaviour, with two transforms in one family - both gated on `/skill-forge`'s A/B equivalence harness. **compress** (Transform #1): a local core->pointer pass + an A/B-validated distill loop producing the smallest behaviourally-equivalent document; point at core knowledge the model holds, keep project-specific detail verbatim. **directive-clarity** (Transform #2): rewrites latent-action instructions into directives that name the action, gated on a measured directness gain at zero regression. Forged by `/skill-forge` |
+| `/semantic-compress` | [`semantic-compress/SKILL.md`](./semantic-compress/SKILL.md) | Optimize LLM-directed instructions while preserving behaviour, with two transforms in one family - both gated on the `ab-equivalence` library skill's A/B harness. **compress** (Transform #1): a local core->pointer pass + an A/B-validated distill loop producing the smallest behaviourally-equivalent document; point at core knowledge the model holds, keep project-specific detail verbatim. **directive-clarity** (Transform #2): rewrites latent-action instructions into directives that name the action, gated on a measured directness gain at zero regression. Forged by `/skill-forge` |
+
+## Plugin-only
+
+Claude Code only; not in the standalone-ZIP build.
+
+| Skill | Base doc | Description |
+|-------|----------|-------------|
+| `/ghsync` | [`ghsync/SKILL.md`](./ghsync/SKILL.md) | Bulk-clone and fast-forward sync every GitHub repo you can access across an org |
+| `/ghreport` | [`ghreport/SKILL.md`](./ghreport/SKILL.md) | Read-only org repo state report - open PRs, default-branch CI, security alerts and branch protection per repo, reusing `/ghsync`'s repo discovery |
+
+## User-invoked
+
+Slash-command-only skills: each sets `disable-model-invocation: true`, so Claude never loads one on its own and its `description` carries no `TRIGGER` clause. Invoke them as `/ai-native-toolkit:<name>` (or `/<name>` when nothing else claims the name). They moved here from the legacy `commands/` directory ([#500](https://github.com/bjcoombs/ai-native-toolkit/issues/500)) with their invocation names unchanged. None ships as a standalone ZIP.
+
+Portable (work in any Claude Code session):
+
+| Skill | Base doc | Description |
+|-------|----------|-------------|
+| `/6hats` | [`6hats/SKILL.md`](./6hats/SKILL.md) | Solo Six Hats analysis - alias for [`/huddle`](./huddle/SKILL.md) at team size 1 |
+| `/understand` | [`understand/SKILL.md`](./understand/SKILL.md) | Deep understanding mode (nemawashi) - exhaustive context-gathering before action |
+
+Workflow (personal setup, opt-in - see [Adapting for your workflow](../README.md#adapting-for-your-workflow) before relying on them):
+
+| Skill | Base doc | Description |
+|-------|----------|-------------|
+| `/tm` | [`tm/SKILL.md`](./tm/SKILL.md) | Task Master orchestration - starts, reviews, or cleans up tasks based on current state |
+| `/issues` | [`issues/SKILL.md`](./issues/SKILL.md) | GitHub-issue marathon - triage open issues, then run agent-ready ones to merge with Agent Teams |
+| `/fix-pr` | [`fix-pr/SKILL.md`](./fix-pr/SKILL.md) | Autonomous PR fixing loop - iterates on CI failures and review comments until green |
+| `/fix-develop` | [`fix-develop/SKILL.md`](./fix-develop/SKILL.md) | Autonomous fix loop for failing CI on the repo's default branch |
+| `/tm-marathon-config-example` | [`tm-marathon-config-example/SKILL.md`](./tm-marathon-config-example/SKILL.md) | Reference configuration block to drop into a project's `CLAUDE.md` for marathon-mode `/tm` and `/issues` |
+
+`/tm`, `/issues`, `/fix-pr`, and `/fix-develop` share the [`marathon`](./marathon/SKILL.md) and [`pr-review-merge`](./pr-review-merge/SKILL.md) library skills as their single source of truth. Each workflow supplies a thin work-source adapter; the library skills own the execution.
 
 ## Assessment helpers
 
@@ -26,7 +57,7 @@ Work in any Claude Code session, and are also distributed as standalone ZIPs for
 
 ## Team-orchestration library skills
 
-Invoked by the workflow commands ([`/tm`](../commands/tm.md), [`/issues`](../commands/issues.md), [`/fix-pr`](../commands/fix-pr.md), [`/fix-develop`](../commands/fix-develop.md)), never standalone. Excluded from the standalone-ZIP build.
+Invoked by the workflow skills ([`/tm`](./tm/SKILL.md), [`/issues`](./issues/SKILL.md), [`/fix-pr`](./fix-pr/SKILL.md), [`/fix-develop`](./fix-develop/SKILL.md)), never standalone. Excluded from the standalone-ZIP build.
 
 | Skill | Base doc | Description |
 |-------|----------|-------------|
@@ -40,12 +71,12 @@ Marathon certifies *process* (tasks closed, CI green, PRs merged); none of that 
 
 ### When a contract is required
 
-Every marathon run started by [`/tm`](../commands/tm.md) or [`/issues`](../commands/issues.md), source-agnostic. There are exactly **two doors** and no third:
+Every marathon run started by [`/tm`](./tm/SKILL.md) or [`/issues`](./issues/SKILL.md), source-agnostic. There are exactly **two doors** and no third:
 
 - **Frozen contract** - a contract authored, kill-tested, and frozen before decomposition. The only path that can certify `PASS`.
 - **Operator-signed skip** - `operator_signoff` recorded before the run starts. Loud, human-authorized, and permanently capped at `UNVERIFIED`; it can never green. Skip is an amendment door too, so it is capped, not free.
 
-`scripts/contract/start_gate.py <run-id>` fails closed (non-zero) unless one of the two exists; each command invokes it before decomposing. The run identifier is a Task Master tag for `/tm`, an issue-queue slug for `/issues`.
+`scripts/contract/start_gate.py <run-id>` fails closed (non-zero) unless one of the two exists; each workflow skill invokes it before decomposing. The run identifier is a Task Master tag for `/tm`, an issue-queue slug for `/issues`.
 
 ### Authoring a contract
 
@@ -71,7 +102,7 @@ Run-complete is redefined and gated in code. A fresh non-implementing agent exec
 
 ### Relationship to marathon and pr-review-merge
 
-The executable spine is `start_gate.py` -> chokepoint -> `validate_completion.py` -> `complete_gate.py`, each fail-closed. `marathon` invokes the start gate before decomposition and the chokepoint + complete gate at run-complete; `pr-review-merge` carries only a note that a green, merged PR is a process signal that never substitutes for these gates. All four marked files - [`marathon/SKILL.md`](./marathon/SKILL.md), [`pr-review-merge/SKILL.md`](./pr-review-merge/SKILL.md), [`../commands/tm.md`](../commands/tm.md), [`../commands/issues.md`](../commands/issues.md) - carry the literal `floor:cold-verify-completion` marker plus the gate invocation strings; `.github/workflows/floor.yml` (a required check) fails any PR that removes a marker or invocation from a file that previously carried it. The **retro boundary** excludes `FLOOR.md`, the markers, `floor.yml`, `scripts/contract/`, `scripts/canaries/`, and `tests/canaries/` from self-rewrite - the retro may propose changes to them, never self-apply.
+The executable spine is `start_gate.py` -> chokepoint -> `validate_completion.py` -> `complete_gate.py`, each fail-closed. `marathon` invokes the start gate before decomposition and the chokepoint + complete gate at run-complete; `pr-review-merge` carries only a note that a green, merged PR is a process signal that never substitutes for these gates. All four marked files - [`marathon/SKILL.md`](./marathon/SKILL.md), [`pr-review-merge/SKILL.md`](./pr-review-merge/SKILL.md), [`tm/SKILL.md`](./tm/SKILL.md), [`issues/SKILL.md`](./issues/SKILL.md) - carry the literal `floor:cold-verify-completion` marker plus the gate invocation strings; `.github/workflows/floor.yml` (a required check) fails any PR that removes a marker or invocation from a file that previously carried it. The **retro boundary** excludes `FLOOR.md`, the markers, `floor.yml`, `scripts/contract/`, `scripts/canaries/`, and `tests/canaries/` from self-rewrite - the retro may propose changes to them, never self-apply.
 
 ### Honest narrowness
 
@@ -79,16 +110,17 @@ For the interactive/visual class that motivated this - the class where the machi
 
 ### Artifact paths
 
-All paths relative to the repo root unless prefixed `.taskmaster/` (which lives at the Task Master container level).
+All paths relative to the repo root. `<contract-dir>` is `.claude/contracts/` unless overridden by a script's `--contract-dir` flag or the `ACCEPTANCE_CONTRACT_DIR` environment variable; a repo that has only `.taskmaster/contract/` keeps using it (`scripts/contract/contract_location.py` holds the rule). When the agent cannot write under `.claude/` without a permission prompt, set `ACCEPTANCE_CONTRACT_DIR` to a folder it can write to.
 
 | Artifact | Path |
 |---|---|
-| Acceptance contract (per run) | `.taskmaster/contract/<run-id>.contract.md` |
-| Completion record (per run) | `.taskmaster/contract/<run-id>.completion.json` |
-| Provenance side-channel (per run) | `.taskmaster/contract/<run-id>.provenance.json` (chokepoint-only) |
+| Acceptance contract (per run) | `<contract-dir>/<run-id>.contract.md` |
+| Completion record (per run) | `<contract-dir>/<run-id>.completion.json` |
+| Provenance side-channel (per run) | `<contract-dir>/<run-id>.provenance.json` (chokepoint-only) |
 | Constitutional floor | `FLOOR.md` |
 | Floor CI workflow | `.github/workflows/floor.yml` |
-| Gates + schema + verifier | `scripts/contract/` (`start_gate.py`, `freeze.py`, `spawn_verifier.py`, `validate_completion.py`, `complete_gate.py`, `completion.schema.json`) |
+| Readiness check prompt | [`scripts/contract/readiness_check_prompt.md`](../scripts/contract/readiness_check_prompt.md) |
+| Gates + schema + verifier | `scripts/contract/` (`contract_location.py`, `start_gate.py`, `freeze.py`, `spawn_verifier.py`, `validate_completion.py`, `complete_gate.py`, `completion.schema.json`) |
 | Canary harness + fixtures | `scripts/canaries/run_canaries.py`, `tests/canaries/` |
 | Contract test modules | `tests/contract/` |
 | External-anchor proof | `docs/floor-anchor-proof.md` |

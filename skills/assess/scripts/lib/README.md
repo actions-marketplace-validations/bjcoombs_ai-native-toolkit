@@ -2,9 +2,12 @@
 
 Deterministic library modules for the `/assess` engine. No LLM calls anywhere in this
 package - every function is a pure transform of filesystem, git, or pre-computed signal
-data, with one bounded exception: live GitHub reads, confined to `gh_cli.py`, which are
-optional (they need a github.com remote and an authenticated `gh`) and degrade to
-`available: False` with a reason, never to a clean result. The LLM reads
+data, with two bounded exceptions. Live GitHub reads are confined to `gh_cli.py`; they
+are optional (they need a github.com remote and an authenticated `gh`) and degrade to
+`available: False` with a reason, never to a clean result. The opt-in mutation pass's uv
+runner (`test_pressure/mutmut3.py`) may fetch mutmut, pytest and the assessed package's
+dependencies from the package index on first use, into a scratch environment; it runs
+only on explicit consent and degrades to a named `reason`. The LLM reads
 `run-context.json` after the core finishes; it does not call into these modules.
 
 ## The assess_core.py -> lib seam
@@ -36,8 +39,18 @@ adding such a scan edits its own module, its test, that table and this file - no
 batches; until then both patterns exist, and the table is the one to extend.
 
 Seeing these two files in the same commit as `assess_core.py` is expected, not a
-defect. If the core is later decomposed, treat this seam as the natural boundary -
-`doc_graph` and `keyhole_signals` are where the cut-line already lives.
+defect.
+
+The core keeps only the orchestration: `build_run_context`, `run_opt_in_mutation` and
+`main`, plus `_new_run_id` and `_read_plugin_version`. Its helpers live in seven modules, one per seam: `instruction_files.py`
+(instruction-file grading), `diff_reliability.py` (cross-run diff trust),
+`wiki_state.py` (first-flagged dates and run supersession), `run_wiki.py` (the wiki
+pages, index and log for one run), `context_blocks.py` (scan results serialised into
+run-context blocks), `mutation_cap.py` (the `test_pressure` shape and the Layer 6 cap)
+and `run_scope.py` (`--scope` and the artifact directory), plus the
+`artifact_schema.py` constant. A change to one of these concerns edits its module and
+its test; `assess_core.py` moves only when the order of the pipeline or the
+run-context key order changes.
 
 ## The wider co-change seams (cohesion, not entanglement)
 
@@ -57,8 +70,15 @@ agent) trusts the boundary deliberately rather than being surprised by the seam:
 - **`scripts/` (standalone build) <-> `skills/`.** The standalone-skill build under
   `scripts/` vendors and transforms the very skills it packages, so a change to a skill's
   shape and the build that ships it co-change by construction. That seam is documented in
-  `CLAUDE.md`'s "Standalone skill pipeline" section; it is cohesion between a packager and
+  `docs/contributing/standalone-skills.md`; it is cohesion between a packager and
   the thing it packages, not a leak.
+- **The `actions/checkout` pin across `.github/workflows/*`,
+  `skills/assess/templates/assess-gate.yml.template` and `README.md`.** The gate the
+  skill generates, the repo's own workflows and the README's copy-paste snippet pin the
+  same release by commit SHA. Dependabot bumps only the workflow pins, so the template
+  and README follow by hand in the same PR. `skills/assess/tests/test_ci_workflow.py`
+  fails the build when the template's pin drifts from `.github/workflows/assess-gate.yml`
+  or the README.
 
 None of these is a refactor task. They are recorded here so the seam is owned: if any is
 ever cut, this note is where the intended boundary is written down.
@@ -150,6 +170,23 @@ Python import-graph analysis (Signals A1-A4) via `grimp` + `networkx`:
 Degrades to `available: False` when `grimp`/`networkx` are absent rather than
 blocking the run.
 
+Packages resolve by path, never by import name. grimp's default finder asks
+`importlib.util.find_spec`, which answers from `sys.modules` first, so a target
+package named `lib` (this repo's own `skills/assess/scripts/lib`) or `json` was
+graphed from whichever module of that name the running `/assess` had already
+imported. `build_import_map` swaps in a finder that maps each name to the
+directory `discover_packages` found, for the length of each build, and leaves
+`sys.path` and `sys.modules` alone. Two discovered packages sharing a name
+(`a/lib`, `b/lib`) go in separate builds, are graphed under their repo-relative
+paths, and are listed in the block's `name_collisions`. Each root holding a
+colliding name is a build of its own; all other roots share one. Any import
+between builds is unresolved, not only an import of the colliding name, since
+which copy wins depends on a runtime `sys.path`. The finder implements both shapes of
+grimp's package-finder port (`determine_package_directory` before 3.14,
+`determine_package_directories` from 3.14), so the `grimp>=3.0` floor holds.
+`structure_drift.py` builds its module map and communities through the same
+`build_import_map` / `import_digraph`.
+
 ### Document analysis
 
 **`doc_graph.py`** *(co-change hotspot)*
@@ -213,7 +250,35 @@ writer read `.doc_graph` into model context, so both drop the key with
 `tests/test_plugin_contract.py` fails a shipped single-line `jq` read of the whole
 block that does not. One reader sits outside that guard: `skills/assess/SKILL.md`
 tells the orchestrator to read `run-context.json` before writing the report,
-which takes the whole file, `link_parents` included.
+which takes the whole file, `link_parents` included. Link syntax and the link pass
+live in `doc_links.py`; the SVG's render-side helpers live in `doc_graph_layout.py`.
+
+**`doc_links.py`**
+The link half of `doc_graph.py`, split out to stop that file's growth. Parses
+`[[wikilinks]]` and `[text](relative/path)` links, strips the code spans and fenced
+blocks (backtick or tilde, behind blockquote and list-item markers) that only show link
+syntax, and resolves each target: a wikilink by note name across the vault (a name shared
+by two notes prefers the source's directory and counts as ambiguous), a CommonMark link
+relative to the doc or from the repo root. `harvest_links` adds the `link` edges to the
+graph and returns a `LinkHarvest` of broken links ("ghosts"; a link to an existing
+directory is not one), doc->code links, the ambiguous-wikilink count, and the per-doc
+count of URI-scheme links (`mailto:`, `tel:`, `http:`) that `raw_source.py` reads as the
+machine-extraction fingerprint. Stdlib only and imports no `lib` module, so
+`doc_graph.py` passes its doc and code extension sets in. `doc_graph.py` also reuses
+`strip_fenced_lines` and `INLINE_CODE_RE` for its reference-edge and missing-xref scans.
+Co-changes with `doc_graph.py` (its only caller) and its test `tests/test_doc_links.py`;
+`skills/assess/tests/test_doc_graph.py` covers the same rules end to end.
+
+**`doc_graph_layout.py`**
+Render-side helpers over a built doc graph, used by `doc-graph-svg.py`:
+`radial_shells` orders nodes into concentric shells by link distance from the entry
+points, with unreachable docs chunked into widening outer rings; `classify_node` names a
+node's status (entry, reachable, orphan, island); `group_broken_links` collapses broken
+links into one ghost per missing file, keying markdown targets by their resolved path
+(root-absolute and `../` spellings merge) and wikilinks by bare name. Graph traversal and
+bookkeeping only, no plotting, so it is unit-tested without numpy or matplotlib.
+Stdlib only. Co-changes with `doc-graph-svg.py` and its test
+`tests/test_doc_graph_layout.py`.
 
 **`raw_source.py`**
 Raw-source subtree detection (issue #225). Threshold-based, IO-free classifier:
@@ -268,15 +333,23 @@ a fixture-backed test here alongside any predicate change.
 **`doc_staleness.py`**
 Doc-staleness metric for Layer 0. Associates each doc with the code it describes via
 nearest-ancestor base-doc rules, computes code churn relative to doc maintenance, and
-emits a signed ratio (high = decaying map). The association logic reuses `doc_graph`'s
-code-link edges. For *generated* docs it reads `doc_provenance` (per-doc and via the
-`[[generated]]` config map) and replaces the churn ratio with a source-vs-doc verdict.
-`last_commit_days` and the instruction grader's `freshness_days` (via `content_clock`)
-both read `git_churn.content_commit_clock`, and the skipped bulk commits are reported as
-`bulk_commits_skipped` (newest first, capped) with `bulk_commits_skipped_total`. A doc
-dated by the creation fallback carries `last_change_basis: "creation"` and confidence
-`low`, which keeps it out of the stale-hub finding; `creation_date_fallback_count` counts
-them.
+emits a signed ratio (high = decaying map). `ratio` is the whole-window ratio
+(`window_ratio`, subject churn over doc edits) capped by `code_churn_since_doc_change`,
+the distinct subject commits authored after the doc's last content change, so a doc is a
+decaying map only while it is behind its subject: one corrected after its subject's last
+change scores 0 however busy the window was, and new churn after the fix raises it again.
+Both `stale_hubs` and the `lying_map` join read this capped `ratio`. The association logic
+reuses `doc_graph`'s code-link edges. For *generated* docs it reads `doc_provenance`
+(per-doc and via the `[[generated]]` config map) and replaces the churn ratio with a
+source-vs-doc verdict. `last_commit_days` and the instruction grader's `freshness_days`
+(via `content_clock`) both read `git_churn.content_commit_clock`, and the skipped bulk
+commits are reported as `bulk_commits_skipped` (newest first, capped) with
+`bulk_commits_skipped_total`. A doc dated by the creation fallback carries
+`last_change_basis: "creation"` and confidence `low`, which keeps it out of the stale-hub
+finding; `creation_date_fallback_count` counts them. The `modularity` block's `base_doc_dir_ratio`
+is code directories holding a base doc over all code directories; a base doc in a
+directory with no code (`docs/`, `agents/`) counts in neither, so the ratio stays
+within 0-1 (tests: `tests/test_doc_modularity.py`).
 
 **`doc_provenance.py`**
 Provenance-aware staleness for generated docs (issue #178). Parses a doc's YAML
@@ -359,6 +432,21 @@ repo-wide couplings; `assess_core.py` serialises the Tier 0 + Tier 1 result into
 
 ### Signal integration
 
+**`context_blocks.py`**
+Serialises scan results into run-context blocks for `build_run_context`, each
+degrading to an explicit unavailable block rather than a false negative.
+`accretion_block` keeps the accretion files already in the top complexity/size band,
+worst first, capped at `MAX_ACCRETION_FILES` (12); `accretion_lookup` gives the hotspot
+pages a per-path view of the same scan. `excluded_generated` and `generated_exclusion`
+read the stats file's generated-file exclusions. `attach_structure_drift` runs the Tier
+0 ownership check (`structure_drift.detect_path_existence_drift`) and joins it with the
+Tier 1 counts `keyhole_signals` computed, omitting the block when no ownership map
+exists. `build_stale_hubs` joins doc-graph PageRank with doc staleness (low-confidence
+baseline entries rank at half weight). `attach_liveness_blocks`,
+`coverage_report_block`, `attach_keyhole_blocks` and `attach_exclusion_disclosures`
+copy the liveness, coverage, keyhole and exclusion-disclosure blocks into the context.
+Runs no scan of its own besides Tier 0. Tests: `tests/test_context_blocks.py`.
+
 **`scan_registry.py`**
 The declared table of run-context scans and the loop that runs it. A `ScanSpec` names
 the run-context `key`, the callable, the names it `reads` (passed positionally: a
@@ -376,7 +464,27 @@ degrades. `stage` exists to keep
 `run-context.json` key order unchanged while scans migrate here; it goes when the
 hand-wired assignments between the stages are gone. Currently registered:
 `agent_ops`, `config_drift`, `review_reality`, `gate_cost_estimate`,
-`instruction_claims`.
+`instruction_claims`, `claude_config`, `nested_instructions`, `agent_harness`,
+`agent_environment`. Besides
+`repo_root` and
+`instruction_files`, the core provides `scope` (the absolute `--scope` path, or
+None) and `excludes` (the `(dirs, patterns)` pair from `.assess/config.toml`).
+
+**`run_context_types.py`**
+`TypedDict` shapes for run-context records a second `lib/` module builds or reads
+(broken links, doc-to-code edges, dead-code candidates, source trees, the raw-source
+and working-notes classifier signals, bulk commits, co-change pairs, B3 coupling rows,
+the keyhole blocks, derived findings and attention rows that `context_blocks` and
+`mutation_refresh` read back from `keyhole_signals`, and the `test_pressure` block),
+plus the other row shapes of the blocks those belong to: the `doc_graph`, `dead_code`,
+keyhole and `test_pressure` blocks keep all their rows here. The orchestrators' file
+shapes live here too, so those scripts stay under their file-size ceilings: the stats
+sidecar rows and blocks `complexity-treemap.py` writes, and the `finalize-input.json`
+and action-lifecycle shapes `assess_finalize.py` reads. `JsonDict` (`dict[str, Any]`)
+names a block whose keys are genuinely dynamic. Any other shape stays in the module
+that builds it. Annotations only: no runtime behaviour, so the serialised run-context
+is unchanged. mypy runs with `disallow_any_generics` on for every script
+(`pyproject.toml` `[tool.mypy]`), so a bare `dict` fails the gate.
 
 **`keyhole_signals.py`** *(co-change hotspot)*
 Integration barrier between the individual signal modules and `assess_core`. Derives
@@ -414,11 +522,67 @@ prune stands down when the rename map is incomplete, since an unfolded old path 
 evidence of a deletion, and `rename_map_complete` carries that state into the block so
 the report can say renames were not read. Each
 block build is wrapped in a catch-all so one signal's failure degrades that block to
-`available: False` rather than crashing the run. It also runs `structure_drift.py`'s Tier 1
+`available: False` rather than crashing the run. `render_findings_markdown` renders at most
+`MAX_FINDING_PATHS_RENDERED` paths per finding and `MAX_ATTENTION_ROWS_RENDERED`
+attention rows, and discloses any cut with an italic omission row naming the
+`run-context.json` key that holds the rest (#440). It also runs `structure_drift.py`'s Tier 1
 grouping disagreement (fed the behaviour block's co-change pairs so no second git-log parse
 happens) and folds its hidden-seam direction into the `hidden_coupling` finding, returning the
 Tier 1 result for `assess_core` to serialise into the `structure_drift` run-context block - so
 structure-drift findings flow through this barrier rather than being assembled in the orchestrator.
+`integrate` itself only sequences named steps: `_prepare_commit_sets` (parse, rename-fold,
+scope), `_integrate_blocks` (the four `_safe_block` builds), one `_*_paths` helper per finding
+that needs more than a list comprehension, `_finding_path_inputs` (the `assemble_findings`
+input, with the degenerate-churn gate on `_CHURN_DERIVED_FINDINGS`) and `_filter_findings`
+(prune, then config excludes). A new finding adds a helper and a key there, not a branch in
+`integrate`; the C901 gate keeps each step under ccn 15. The attention list and every
+product rendered from the findings (`findings_markdown`, `keyhole_summary`,
+`attention_low_signal`, `prescribed_actions`, `archived_finding_paths`) come from one
+function, `finding_products`, which `mutation_refresh.py` calls too.
+
+**`untrusted_hotspot.py`**
+The E1 trust axis, a leaf module. `find_untrusted_hotspots` crosses the complexity
+`top_hotspots` with the per-file mutation survivor density in `test_pressure.per_file`
+and returns the hotspots at or over `DEFAULT_SURVIVOR_DENSITY_THRESHOLD` (0.3);
+`untrusted_hotspot_paths` wraps it so a malformed block degrades to `[]`. Silent without
+per-file mutation data, so the default read-only run never fires it. `keyhole_signals`
+re-exports `find_untrusted_hotspots` and `DEFAULT_SURVIVOR_DENSITY_THRESHOLD`. Tests: `tests/test_keyhole_untrusted_hotspot.py` (E1 cases) and
+`tests/test_mutation_refresh.py`.
+
+**`mutation_cap.py`**
+The run-context `test_pressure` block shape and the Layer 6 cap derived from it.
+`normalize_test_pressure` passes a well-formed `scan_test_pressure` result through and
+turns a failed or malformed one into an explicit `available: False` block with a null
+`mutation_config_present` and empty `cheap_heuristics` buckets, so a failed scan never
+reads as "no mutation setup". `mutation_not_run_cap` sets `applies` unless the block
+claims `mutation_run` *and* carries at least one parsed record in `per_file` (#317);
+while it applies, Layer 6 is capped at Partial and must carry
+`MUTATION_NOT_RUN_ANNOTATION`. Its `partial` flag is set when mutation ran but every
+`mutation_groups` entry with records is `partial` (stopped at the budget); `applies`
+stays False, and Layer 6 is still held at Partial with `MUTATION_PARTIAL_ANNOTATION`.
+One complete group lifts the hold. `layer6_cap_violation` turns the cap into the
+refusal `assess_finalize` raises. Both the default run and
+`assess_core --opt-in-mutation` call it, so the two write one shape. Tests:
+`tests/test_mutation_cap.py`, `tests/test_mutation_cap_partial.py`, `tests/test_assess_core.py`
+(opt-in pass).
+
+**`mutation_refresh.py`**
+Rebuilds the keyhole products that read `test_pressure` after the opt-in mutation pass
+(`assess_core --opt-in-mutation`), which otherwise rewrote only `test_pressure` and left
+E1 unable to fire in a real run. `refresh_mutation_findings` recomputes
+`untrusted_hotspot` through `untrusted_hotspot_paths` and `apply_config_excludes`, keeps
+every other finding and its action as stored (none of them reads `test_pressure`),
+reassembles in `FINDING_ORDER` through `assemble_findings`, then rewrites
+`derived_findings`, the `finding_products` keys and `excluded_as_archive`, and rebuilds
+`excluded_by_config` with the config-excluded E1 paths, recording the ones a pass added
+under `added_by_mutation_pass` so a later pass that no longer suppresses them takes them
+back out. Only `untrusted_hotspot` is inserted when an older run-context lacks it.
+A run-context with no `derived_findings` list is left untouched (returns `False`).
+`assess_core` hands it this run's `complexity-stats.json` (the scoped one under
+`--scope`) and the excludes from `recorded_excludes` (the `excluded_by_config` dirs
+and patterns the default run applied and disclosed, or `load_excludes` when the
+block is absent), then rewrites `badge.json` through `badge.write_findings_badge`. Tests:
+`tests/test_mutation_refresh.py`.
 
 The behaviour block exports the co-change pairs twice, at two scales. `change_coupling_pairs`
 is the repository-wide list, cut to `MAX_COUPLING_PAIRS` (100), and `change_coupling_pairs_total`
@@ -477,6 +641,14 @@ conservative agent/human classification is defined one way.
 
 ### Configuration
 
+**`run_scope.py`**
+`resolve_scope` turns a `--scope` argument into the absolute path, the repo-relative
+path and the artifact-directory slug, raising `ValueError` for a missing or
+outside-repo path; a whole-repo run returns `(None, None, "")`. `assess_dir_for` names
+`.assess/` or `.assess/<slug>/`, and `load_current_stats` reads that directory's
+`complexity-stats.json`, or an empty snapshot when none was written. Tests:
+`tests/test_scope.py`.
+
 **`assess_config.py`**
 Reads the optional per-repo `.assess/config.toml`: `exclude_dirs` / `exclude_patterns`
 (the same two lists feed every scan - heatmap, doc graph, staleness, liveness - so
@@ -489,13 +661,86 @@ is the single shared path that combines config excludes with CLI `--exclude`; bo
 CLI and `doc-graph-svg.py` call it, so every artifact computes over the identical doc/code set.
 Degrades silently on missing or malformed config rather than blocking the run.
 
+**`decline_markers.py`**
+Reads the `.assess/.no-<tool>` markers that record a permanent decline of an optional
+tool (`scc`, a dead-code linter, or the `mutmut` / `stryker` mutation pass). Markers
+are JSON carrying `declined_by` / `declined_at` / `plugin_version` / optional `reason`;
+a legacy empty `touch`-ed marker is still honoured as a decline, with no provenance.
+A marker written under an older plugin *major* carries `reoffer: True`, and
+`build_decline_block` returns the run-context `decline_markers` block: the per-marker
+provenance, `reoffer_mutation` (true only for a stale mutation-tool decline, the
+SKILL.md Step 2d re-offer flag), and one-line `disclosures` so an active decline is
+never invisible in the report. Legacy markers have no version and are never
+re-offered. Pure stdlib; never raises. Called by `assess_core.py`.
+
+**`interactivity.py`**
+Decides whether a run may prompt a human. Interactive is the default; the run is
+non-interactive only on an explicit signal - the orchestrator's `--non-interactive`
+flag, `ASSESS_NON_INTERACTIVE`, or `CI` set in the environment. `isatty()` is
+deliberately not consulted: the core always runs as a tool subprocess with no
+controlling terminal. `build_offers_block` returns the run-context `interactive` flag
+and `offers` list - empty when interactive (the orchestrator asks live), otherwise
+every type in `OFFER_TYPES` recorded as `skipped`, so a headless run completes with
+no prompts and an audit trail. Pure stdlib, no side effects. Called by
+`assess_core.py`; the consent contract is in `references/consent-lifecycle.md`.
+
 ### Output and formatting
+
+**`artifact_schema.py`**
+`ARTIFACT_SCHEMA_VERSION`, the run_id provenance schema stamped on every artifact a run
+writes (run-context.json, the badge, the wiki pages); the version history is in the
+module comment. `complexity-treemap.py` carries a copy that
+`tests/test_complexity_treemap.py` holds equal to it.
+
+**`run_wiki.py`**
+Writes this run's wiki through `wiki_writer`: `write_run_wiki` writes a page per current
+top hotspot (status from the stats diff, first-flagged date, the `Has test file` row
+from `_has_sibling_test`, marker debt and accretion in the briefing), retires orphan and
+excluded-before-finalize pages, adds graduated hotspots to `index.md` with their current
+metrics, saves `first-flagged.json`, replaces a superseded unfinalized log entry and
+appends this run's, then verifies the log chain. It returns a `RunWiki` (the test index
+it built, the retired and dropped paths, the chain verdict) for `build_run_context` to
+copy into run-context.json. Tests: `tests/test_run_wiki.py`,
+`tests/test_sibling_tests.py`, `tests/test_log_supersede.py`.
+
+**`wiki_state.py`**
+The wiki state carried between runs. `load_first_flagged` / `save_first_flagged` read and
+write `first-flagged.json`, and `rekey_first_flagged` moves a renamed file's date to its
+current path, keeping the earlier date on a collision. `same_measurement_prior_run`
+finds the previous run-context when this run measures the same commit on the same day;
+`excluded_after_unfinalized_run` and `retire_excluded_unfinalized` handle the files only
+a never-finalized superseded run flagged and config now excludes (#356);
+`sweep_superseded_history` and `drop_superseded_log_entry` remove that run's history
+rows and log entry (#355, #421). Tests: `tests/test_wiki_state.py`,
+`tests/test_run_wiki.py` (index rows), `tests/test_log_supersede.py`.
 
 **`wiki_writer.py`**
 Renders and writes the `.assess/` wiki files (`index.md`, `log.md`,
 `hotspots/*.md`) from string templates. No LLM calls. Pure string formatting + file IO.
 An optional `run_id`/`schema_version` prepends a non-rendering HTML-comment
 provenance stamp to each file (omitted -> byte-identical legacy output).
+Both persistent pages compound across runs rather than reflecting only the latest
+one. `write_hotspot_page` reads the page's existing history table
+(`parse_history_rows`, which reads pre-`Run`-column five-cell rows with `-` as the
+run) and `merge_history_rows` appends this run's row, ordered by date, replacing
+only a row with the same run date and short run id. Before the pages are
+rewritten, `sweep_superseded_history_rows` removes a superseded, never-finalized
+run's row from every page on disk, including files this run does not rank, matching
+the log entry the core drops (#421). The page labels its `ccn` the file aggregate and
+adds a `Worst function` row only when the sidecar's `max_fn_ccn` / `max_fn_name` are
+set (#423). `format_ccn` renders integral sidecar floats as integers; the worst
+function is shown unclamped, with a note when it exceeds the aggregate (a Dart file's
+aggregate is scc's, its worst function the Dart scanner's), and a `|` in its name is
+escaped. `write_index` seeds from the prior `index.md` rows (`parse_index_rows`)
+and from every hotspot page on disk (`read_hotspot_page_entries`), then
+`merge_index_entries` lets this run's entries win per path: a path the run did not
+rank keeps its last known row but renders `graduated` (it is not a hotspot this
+run, whatever live status its page last carried), a carried row whose page is
+retired takes the retired status, and no row is kept for a path excluded before
+finalize (its page's status, or the core's `never_assessed` list) or now excluded
+as generated (the core's `excluded_as_generated` predicate) (#420). The
+`merge_index_entries` docstring lists each reason a path can be absent and the row
+it gets.
 Also guards wiki integrity: `prune_orphan_hotspots(assess_dir, repo_root)` stamps
 any hotspot page whose source file left the tree as `retired - file deleted`
 (history preserved, no active page lies about a live file), and
@@ -523,6 +768,8 @@ a legacy wiki (no markers, live files) is untouched and reads valid.
 Shared treemap layout and SVG primitives for the code heatmap and the doc-staleness
 heatmap. Pulls `matplotlib`, `squarify`, and `numpy`. Must not be imported by the
 deterministic core (which runs with `networkx` alone) - only by the treemap scripts.
+Also holds `plural(n, singular)`, the count-agreement helper both SVG renderers use
+for generated text ("1 island", "9 islands").
 
 **`ci_workflow.py`**
 Renders the frozen-harness GitHub Action from `templates/assess-gate.yml.template`
@@ -536,18 +783,147 @@ repo's other workflows for a `paths:` / `paths-ignore:` key under a `pull_reques
 trigger or a `dorny/paths-filter` step,
 which is when the CLI applies `DEFAULT_PATHS_IGNORE` (`**/*.md`, `.assess/**`).
 
+**`diff_reliability.py`**
+Decides whether the cross-run diff can be trusted. `compute_diff_reliability` returns
+`(diff_reliable, diff_version_note, diff_trend_reset)`: a first run is reliable; a
+missing or unparseable plugin version, a changed stats schema or a MAJOR plugin bump
+voids the diff (MAJOR also resets the trend); a MINOR/PATCH bump keeps it armed unless a
+complexity backend's version moved (`stats_tool_versions` reads the `<tool>_version`
+stamps, skipping `_NON_TOOL_VERSION_KEYS`). `prior_stamps` reads the prior snapshot's
+plugin and schema versions. Stdlib only. Tests: `tests/test_diff_reliability.py`,
+`tests/test_complexity_treemap.py`.
+
 **`stats_diff.py`**
 Compares current complexity stats against a prior run and classifies hotspot
-transitions: graduated (was in top list, now absent), regressed (worsened), new, and
-persistent. Pure set operations + arithmetic, no LLM.
+transitions: graduated (was in top list, now absent), regressed, restructured, new,
+and persistent. Pure set operations + arithmetic, no LLM.
+
+Regression keys on the worst single function (`max_fn_ccn`), not the file's `ccn`,
+because `ccn` is a sum over functions: extracting helpers raises it while the worst
+function falls (`assess_core.py` went 238 -> 249 summed, 51 -> 12 worst). The rule:
+
+| Worst function (`max_fn_ccn_delta`) | Aggregate (`ccn` up, or >50 LOC across >2 commits) | Status |
+|---|---|---|
+| rose | any | regressed |
+| fell, by at least the `ccn` rise | worsened | restructured |
+| fell, by less than the `ccn` rise | worsened | regressed |
+| fell | not worsened | persistent |
+| flat, or null (scc / older sidecar) | worsened | regressed |
+| flat, or null | not worsened | persistent |
+
+Flat-worst with a rising sum stays regressed on purpose: a new function added beside
+an unchanged worst one is accretion, not restructuring. The bound on `restructured`
+closes the same loophole from the other side: an extraction raises the sum by about
++1 per helper, far less than the worst function falls, so trimming the worst 16 -> 15
+while adding +100 of new functions still regresses. `restructured` never reaches
+`diff_detail.regressed`, so `assess_gate.py`'s `fail_on_regression` does not fire on
+a helper extraction.
 
 ### Scoring
 
+**`instruction_files.py`**
+Finds and grades the instruction files at `INSTRUCTION_FILE_PATHS` through
+`agent_instructions_grader`. `grade_instruction_files` grades each committed file with
+its content-clock freshness, lets an alias (a symlink or thin stub pointing at a
+canonical file) inherit the target's grade, and returns the untracked and dangling
+files, the skills-directory info and the redacted sensitive-content findings alongside
+the best grade (`None` when no committed file exists, distinct from `F`).
+`broken_instruction_refs` adds doc links to a missing instruction file;
+`detect_ancestor_instructions` names the ancestor and global files a clone never sees
+(#57); `instruction_file_size` feeds the bloat signal. Each graded entry carries the
+grader's `findings` (unresolved commands, stale paths and symbols), graded against an
+`instruction_content.RepoContext`; `grade_instruction_files` and `nested_instruction_surface`
+each build one from the same tree. Tests:
+`tests/test_instruction_files.py`, `tests/test_doc_staleness.py`.
+`nested_instruction_surface(repo_root, excludes)` builds the `nested_instructions`
+block from `instruction_discovery` with the same tracked set, clock and skills
+detection, and runs from the `scan_registry` table.
+
+**`instruction_discovery.py`**
+Finds the instruction files agent tools load below the root or through path-scoped
+rules (#511), no model: nested `CLAUDE.md` / `AGENTS.md` / `AGENTS.override.md` /
+`GEMINI.md` (and `.claude/CLAUDE.md`), `.claude/rules/**/*.md` (`paths`),
+`.github/instructions/**/*.instructions.md` (`applyTo`) and `.cursor/rules/**/*.mdc`
+(`globs`, `alwaysApply`). One pruned walk honours the built-in excludes (minus
+`.claude`, where rules live) and `.assess/config.toml`; only tracked files count.
+Each file not already graded at an `INSTRUCTION_FILE_PATHS` location gets a
+`grade_instructions` entry with its scope (`directory`, `globs`, `always_loaded`).
+Findings: `dead_glob` (a rule, not always loaded, none of whose scope patterns
+matches a tracked file or names a directory on disk; a nested rule's patterns are
+also tried relative to its own directory), `ignored_cursor_md`, `claude_shadows_agents`
+(a directory's `CLAUDE.md` differs from its `AGENTS.md` and does not import it) and
+`repeats_parent` (at least half of a nested file's distinct lines, over five or
+more, copy the nearest ancestor's). Files and findings are capped with `_total`
+counts. Tests: `tests/test_instruction_discovery.py`.
+
+**`instruction_budget.py`**
+The always-loaded instruction text per tool for the root context, in lines, words,
+bytes and estimated tokens (4 characters per token, as the treemap). Claude Code:
+the root `CLAUDE.md` and `.claude/CLAUDE.md` (else the root `AGENTS.md`), their
+`@imports` resolved relative to the importing file (outside code, four hops,
+cycle-guarded, tracked files inside the repo only; the rest listed in
+`skipped_imports`), and root `.claude/rules` files with no `paths`. Codex: the
+root `AGENTS.override.md` or `AGENTS.md` against 32 KiB, plus the heaviest
+root-down chain (`deepest_chain`). Tests: `tests/test_instruction_budget.py`.
+
+**`instruction_globs.py`**
+The scope frontmatter line parser (`paths`, `applyTo`, `globs`, `alwaysApply`; no
+YAML dependency) and the glob matcher behind `dead_glob`: brace sets, `**`, a
+slashless pattern matching at any depth and a pattern matching a directory prefix.
+Lenient on purpose, since a false dead glob would send a maintainer to delete a
+working rule; a negated or uncompilable pattern never reads as dead. Tests:
+`tests/test_instruction_globs.py`.
+
 **`agent_instructions_grader.py`**
 Heuristic scoring of agent instruction files (CLAUDE.md, AGENTS.md, GEMINI.md,
-.cursorrules, .github/copilot-instructions.md) on signals that correlate with LLM
-usefulness: positive directives, tradeoff phrases, path references, verifiable
-outcomes, and freshness. Pure regex + arithmetic, filename-agnostic.
+.cursorrules, .github/copilot-instructions.md), filename-agnostic, no model calls. Since
+#512 it grades on what outcome studies say helps an agent: verified commands earn the most
+credit (12 each, cap 40, resolved by `command_resolver.py`; a standard CLI such as `gh` earns
+4 each, cap 16, inside the same 40), backticked paths count only
+when they exist at HEAD, and directives, tradeoff phrases and verifiable outcomes are a
+small capped floor. A size curve subtracts one point per 10 lines past 200 (or per 120
+words past 2400), capped at 30, halved (never waived) when the repo delegates to skills,
+because the file still loads on every task; past 400 lines or 4800 words the score is
+capped at 59 (a B), skills or not. Directory-tree
+blocks, repository-overview sections and lines repeated from the root README cost points
+too (`instruction_content.py`). The A-F scale and the subscore keys downstream code reads
+(`positive_directives`, `tradeoff_phrases`, `path_references`, `verifiable_outcomes`,
+`line_count`, `word_count`, `bloat_penalty`) are unchanged; new keys are added beside them.
+Commands naming a missing target and stale paths or symbols are `Grade.findings`, never a
+hard fail. Tests: `tests/test_agent_instructions_grader.py`,
+`tests/test_instruction_bloat.py`.
+
+**`command_resolver.py`**
+Extracts the shell commands an instruction file gives (shell-fenced blocks, and inline
+code that starts with a known runner) and checks each names a real target at HEAD without
+running it. Public API: `extract_commands(text) -> list[Command]`,
+`resolve(command, repo_root=None, *, index=None) -> Resolution` (verdict `resolved`,
+`missing`, `external` or `unknown`, plus a `reason`) and `build_index(repo_root)`. Covers npm / pnpm /
+yarn / bun scripts, npx, make, just, uv / poetry run, uvx, tox, nox, pytest, python, go,
+cargo, mvn and gradle, and script paths; an unmodelled runner resolves when a CI line runs
+it verbatim, else it is `external` when its program is a standard CLI in `EXTERNAL_TOOLS`
+(`gh`, `git`, `rg`, `jq`, `docker`, `kubectl`, `aws` and similar: real, but defined outside
+the repo, so never a finding, even with a `{PLACEHOLDER}` argument) and `unknown` ("unresolved: unknown runner") otherwise, which
+is no evidence either way. Independent of the grader so other checks (such as whether an instruction
+file names the repo's check command) can reuse it. Tests: `tests/test_command_resolver.py`.
+
+**`command_index.py`**
+The per-repo index `command_resolver.py` resolves against, read once from the files at
+HEAD (`git ls-files`, tracked symlinks as themselves; a walk outside git): package.json
+scripts and dependencies, Makefile targets, justfile recipes, pyproject names (dependencies,
+`[project.scripts]`, `[tool.*]` tables), pytest presence, tox environments, nox sessions
+and CI configuration lines. Config files are unioned across the repo and a computed target
+makes its family lenient, so a false `missing` stays rare. Tests:
+`tests/test_command_index.py`.
+
+**`instruction_content.py`**
+The repository-checked content signals of the grader: backticked path references that
+exist (and stale ones, with URLs, globs, placeholders, absolute paths, excluded trees,
+gitignored paths and `owner/repo`-shaped slugs left unchecked), backticked code symbols
+no other tracked file names (`git grep`, skipped outside git), directory-tree blocks,
+repository-overview headings and the share of lines repeated from the root README.
+`build_repo_context` reads the repo once per call; the root and nested instruction scans each build one. Paths and symbols are checked against the tracked files (`git ls-files`, `git grep`), so on a dirty checkout an uncommitted edit counts. Tests:
+`tests/test_instruction_content.py`.
 
 **`liveness_scan.py`**
 Layer 1 liveness inputs, three tiers:
@@ -628,8 +1004,36 @@ pass). A marker that survived many edits to an actively-maintained file is
 unactioned intent; calendar age alone can't tell that from dormancy. Classifies
 markers as tracked (issue/ticket/URL/date reference, or a justified suppression)
 vs bare, and each introducing commit as agent/human (reusing `change_coupling`'s
-conservative B4 identity rules). A justified suppression (inline `-- reason` or
-trailing comment) is never stale and is counted in each family row's `justified`
+conservative B4 identity rules). Marker text that is data is not a marker: in a
+Python file `python_regions` places each hit, so one inside a string literal (a
+test fixture, a pattern table) is dropped while a todo or deprecation in a
+triple-quoted docstring still counts as prose about the code (a single-quoted
+docstring opens with a quote, which the comment-context filter does not read as
+a leader); a suppression counts only in a
+comment and a disabled test only in code or a comment. A file that does not
+tokenize, and every other language, keeps the line-based filters below. In any
+code file a line-scoped suppression quoted in a backtick code span on a
+comment-only line is a quotation (after code, ruff still reads it; a block-scoped
+`rubocop:disable`, `pylint: disable` or ESLint block disable stays live quoted), and config files (TOML, YAML, INI,
+JSON) carry no suppression family, since no listed directive is read from them.
+A `todo` token counts only in marker position -
+it opens its comment or prose line (after an optional bullet or checkbox) or a
+leaderless docstring interior line, or carries a colon or a `(owner)` - so a
+sentence that lists marker names is not a marker. In prose a comment leader opens
+a marker only at line start, so an inline example (`` `* TODO` ``) is not one, and
+a leaderless code-file line that opens with a bullet (a YAML enum's `- TODO`) is
+data, not a marker. In a prose file a phrase alternative (`remove after`,
+`temporary workaround`) inside an inline code span or quotation marks (straight
+or curly) is a quoted example and does not count; a bare phrase on the same line
+still does, and a code comment counts whatever the quoting. A justified
+suppression (a ` - reason` or ` -- reason` starting with a word character, or a
+non-empty `(reason)`, after the directive or its codes, or a trailing comment -
+for `type: ignore[...]` the trailing `  # reason` is the only form mypy accepts,
+and `pyright: ignore[...]` takes the same forms;
+a trailing comment that opens with a directive or a todo token is not a
+reason, so `# noqa: S603  # nosec B603` stays bare; the excluded directives are
+the same `SUPPRESSION_DIRECTIVES` list the suppression family detects, so the
+two cannot drift) is never stale and is counted in each family row's `justified`
 (0 outside suppressions); other tracked markers still age, since an issue or a
 deadline can go stale too. The `unactioned_intent` action states the
 `stale_touches_threshold` it applied. Honours the shared excludes and the
@@ -639,6 +1043,19 @@ degrades aging to `aging_reliable: False` on degenerate history (same verdict as
 Feeds the `unactioned_intent` derived finding, the hotspot pages' marker-debt
 sentence, and the Layer 3/5/8 erosion rules. New ecosystem marker syntaxes need a
 fixture in `tests/test_promissory_markers.py` - absence is a silent miss.
+
+**`python_regions.py`**
+Token regions of a Python source for `promissory_markers`: `tokenize` records
+each string literal's span (classed `docstring` when it is a statement of its
+own, `string` otherwise; an f-string, a t-string and a run of implicitly
+concatenated literals each form one span) and each comment's
+opening column, and `PyRegions.region(row, col)` answers `comment` / `docstring`
+/ `string` / `code`. Returns `None` for a source that does not tokenize, so the
+caller falls back to its line filters; `load_regions` memoises per file and
+decodes the bytes with `utf-8-sig`, so a BOM does not shift row 1 against rg's
+output and a lone carriage return is not split into a second row.
+Pure stdlib. Tested with the marker scan in
+`tests/test_promissory_markers_literals.py`.
 
 **`agent_ops.py`**
 Layer 8 workflow-maturity evidence: scans the repo-observable agent-operations
@@ -757,8 +1174,12 @@ flagged, since an appended-to document carries no change risk. Compensates the *
 repo north star. Degrades to `available: False` on git failure and
 `reliable: False` on degenerate history (same verdict as `git_churn`). Reuses
 `git_churn`'s `GIT_TIMEOUT_SECONDS` and `churn_is_degenerate`; imports no
-orchestrator. Add a fixture-backed test in `tests/test_accretion_ratchet.py`
-alongside any change to the flagging rule.
+orchestrator. `net_additions` is net physical lines (numstat additions minus
+deletions over the file's non-merge commits), not scored LOC, so the hotspot
+page's growth-profile line (`wiki_writer`) and the keyhole's per-file items
+label it "lines net" and the deletion share "of churn deleted". Add a
+fixture-backed test in `tests/test_accretion_ratchet.py` alongside any change
+to the flagging rule.
 
 **`archetype.py`**
 Repository archetype detection (issue #224). Classifies a repo as `software` or
@@ -788,9 +1209,11 @@ denominator) and its test `tests/test_archetype.py`.
 **`badge.py`**
 Shields.io endpoint badge for the wiki (`.assess/badge.json`). The shipped badge
 is deterministic by default: `assess_core` always writes the findings-count form
-(`fallback_badge`, "2 findings · 0 stale markers", colour banded from the counts)
-and stamps a `link` to `assess-report.md`, so a badge-clicker lands on the full
-report. The LLM-derived headline (`score_badge`, "7.0/8 · AI-Native",
+through `write_findings_badge` (`fallback_badge`, "2 findings · 0 stale markers",
+colour banded from the counts), which stamps a `link` to `assess-report.md`, so a
+badge-clicker lands on the full report; the opt-in mutation pass rewrites it the
+same way once the refreshed findings are in. The LLM-derived headline
+(`score_badge`, "7.0/8 · AI-Native",
 renormalised over its `denominator` - 8 for software, the applicable-layer count
 for a knowledge-base archetype, e.g. "2.5/3 · Knowledge Base · Solid") is *not*
 written to the badge; it appears inside `assess-report.md`, so the badge never
@@ -882,6 +1305,90 @@ raised, since it runs from the `scan_registry` table); failures feed Layer 0 evi
 claim kind is one extractor in `_EXTRACTORS` and one verifier in `_VERIFIERS`
 (which returns the extra failure fields). Tests: `tests/test_instruction_claims.py`.
 
+**`claude_config.py`**
+Flags Claude Code configuration the runtime treats as legacy or silently ignores
+(issue #502), no model. `scan_claude_config(repo_root, scope, excludes)` reads,
+under the run root (the `--scope` directory, else the repo root),
+`.claude/skills/*/SKILL.md`, `.claude/commands/**/*.md` and
+`.claude/agents/**/*.md`, and for a plugin repository (`.claude-plugin/plugin.json`
+present) `skills/*/SKILL.md` plus the manifest's `skills` directories (which add
+to the default; a root `SKILL.md` when neither exists), and flat `commands/*.md`
+and recursive `agents/` or the paths the manifest's
+`commands` / `agents` keys name instead (those replace the default; a path that
+escapes the root is skipped; a file reached twice through a symlink is read once,
+as plugin configuration). The frontmatter parser is a dependency-free line
+parser for the YAML subset frontmatter uses (top-level keys with their lines,
+block scalars, block lists, one level of nested keys for `experimental`); it is
+case-sensitive, unlike `vault_queries.parse_frontmatter`, because `maxTurns` and
+`maxturns` are different fields, and it records malformed lines rather than
+raising. Finding kinds: `legacy_command`, `unknown_key` (with a rename hint when
+the key normalises to a documented one), `unsupported_value` (closed sets and the
+`model` pattern), `command_unsupported_key` (`name` / `paths`),
+`plugin_agent_ignored`, `malformed_frontmatter`, `unreadable_file`, `stray_markdown` (a `README.md`-style document with no frontmatter under a commands or agents path, which loads as a command or agent; reported instead of the other kinds for that file) and `missing_frontmatter` (an agent file with none); each carries `file`, `line`,
+`key`, `value` and `fix`. The run-context block `claude_config` is
+`{available, reason, snapshot_date, source_urls, plugin_repo, manifest_error,
+files_scanned, files_by_kind, finding_count, counts_by_kind, findings[]}`, or
+`{available: false, reason, snapshot_date}` when the root has no `.claude/` and no
+plugin manifest. It feeds Layer 0 evidence and is not counted in the badge.
+Tests: `tests/test_claude_config.py` (fixture: `tests/fixtures/claude_config_plugin/`).
+
+**`agent_harness.py`**
+The committed agent surface that runs code or exposes secrets (issue #513),
+static and dependency-free. `scan_agent_harness(repo_root, scope, excludes)`
+inventories under the run root, as `executes`, the hooks in
+`.claude/settings.json` and in skill / agent frontmatter, the `env` variable
+names (never values), `apiKeyHelper`, `.mcp.json` servers (command, or URL as
+`scheme://host[:port]`) and
+`.cursor/hooks.json`; a command is reported as its program only, never its
+arguments or leading `VAR=value` assignments. Finding kinds: `tracked_local_settings`,
+`tracked_env_file` (path only), `missing_env_deny` (only where Claude Code is
+configured: a `.claude/` directory or a `CLAUDE.md`), `hooks_forced_on`
+(`disableAllHooks: false`), `broad_allow` (`Bash`, `Bash(*)`, `Bash(:*)`,
+`Bash(**)`, `Bash(*:*)`),
+`credential_mount` (a devcontainer file mounting `~/.ssh`, `~/.aws`,
+`~/.config/gcloud` ...), `hidden_unicode` (zero-width and bidi controls in an
+instruction, rule, skill, command or agent file, reported as code points; a
+ZWJ inside an emoji sequence or a ZWNJ in Arabic-script or Indic text is not) and
+`privileged_comment_trigger` (an `issue_comment` / `pull_request_target`
+workflow that runs a deploy, apply or publish). Workflow and devcontainer files
+are read line by line, not parsed as YAML; the module docstring lists what that
+misses. It reuses `claude_config.parse_frontmatter` for the frontmatter hooks.
+The block is `{available, tracked_known, executes[], executes_by_kind,
+finding_count, counts_by_kind, findings[]}`; `tracked_known: false` (no git)
+means the tracking findings were not checked. Informational: it does not score
+a layer or count toward the badge. Tests: `tests/test_agent_harness.py`.
+
+**`agent_environment.py`**
+Can an agent set up the repository and check its own work (issue #514)?
+`scan_agent_environment(repo_root, instruction_files, agent_harness, excludes)` reads the
+files at HEAD through `command_index.build_index` and writes `{available,
+setup{present, sources[]}, check{entry_points[], named[], named_total,
+unresolved[]}, pinning{manifests[], all_locked}, ci_duration, findings[],
+layer5_cap{applies, ceiling, unmet[], reason}}`. Setup sources:
+`copilot-setup-steps.yml` (credited only when it passes the checks), a dev
+container, `.cursor/environment.json`, a `SessionStart` hook in a tracked
+`.claude/settings.json` (from the `agent_harness` block), `script/setup`,
+`script/bootstrap`, `bin/setup`, `init.sh`, or a Makefile / justfile `setup` or
+`bootstrap` target. Named checks are the check commands a session-loaded
+instruction file gives (root `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`,
+`.cursorrules`, `.github/copilot-instructions.md`), resolved by
+`command_resolver.resolve`, so the verdict matches the grader's. Manifests honour
+the built-in and `.assess/config.toml` excludes. Findings are `copilot-setup-steps.yml` breaches of GitHub's documented
+constraints (one `copilot-setup-steps` job, allowed keys, `timeout-minutes` at
+most 59, the `.yml` path). `layer5_cap` is Partial unless a named check resolves
+and committed setup or a lockfile per manifest exists. `ci_duration` is the one
+network read, through `gh_cli` with a 10-second per-call cap: per-workflow
+median wall time of successful push runs on the default branch, or
+`{available: false, reason}`. Evidence only; it caps nothing.
+Tests: `tests/test_agent_environment.py`.
+
+**`claude_config_fields.py`**
+The documented frontmatter field sets `claude_config` checks against: skill and
+command fields, agent fields, the agent `experimental` keys, the fields plugin
+agents ignore, the closed-value fields and the `model` pattern, with
+`SOURCE_URLS` and `SNAPSHOT_DATE`. Data only, never fetched at run time: updating
+it is one reviewed edit (re-read the pages, change the sets, move the date).
+
 **`anomaly_detector.py`**
 Inspects a run-context dict for suspicious results (e.g. zero files scored, implausible
 CCN) and returns typed `Anomaly` records. Detail strings are sanitised (counts and
@@ -904,6 +1411,33 @@ assessment; `assess_core.py` records provenance ("none found" vs. the file/forma
 separately. Stdlib only, imports no orchestrator. Add fixtures + cases in
 `tests/test_coverage_report.py` alongside any change to a parse rule.
 
+**`coverage_gate.py`**
+Answers the Layer 6 question measurement cannot: is a line-coverage threshold
+*enforced*? `detect_coverage_gate` walks config files (built-in excludes, depth 4,
+so a monorepo package's own config counts) and emits the run-context
+`coverage_gate` block: `{available, enforced, gates, not_detected}`, each gate
+`{file, line, tool, form, threshold, unit, metric}`. Forms read: coverage.py
+`fail_under` in `[tool.coverage.report]` (`pyproject.toml`), `[report]`
+(`.coveragerc`) and `[coverage:report]` (`setup.cfg`, `tox.ini`); `--cov-fail-under`
+and `coverage report|xml|json|html|lcov --fail-under` in GitHub workflows and
+composite actions, CircleCI, `.gitlab-ci.yml`, Jenkins, Azure, Travis, Bitbucket,
+`Makefile`, `justfile`, `Taskfile.yml`, `pytest.ini` / `addopts` and the other
+task-runner files; Jest `coverageThreshold` (config or
+`package.json`); Vitest `coverage.thresholds`; nyc/c8 `check-coverage` (rc file,
+`package.json`, or `--check-coverage --lines N`); JaCoCo `<minimum>` in a `pom.xml`
+and `minimum =` in a `build.gradle(.kts)` that applies JaCoCo. The threshold is
+reported as written (`unit` `percent`, `ratio` for a JaCoCo `0.80`, or
+`uncovered_count` for a negative Jest value), never rescaled. Gates are typed by the `CoverageGate` TypedDict. `enforced` is true when
+any gate has a non-zero threshold, or a null one from nyc/c8 (which check at a
+built-in default); `fail_under = 0` and a Jest/Vitest anchor whose threshold was
+not read are listed but gate nothing.
+Nothing found is `enforced: false`, never inferred from a coverage report, and
+`not_detected` names the forms not read (Go `-coverprofile` scripts, shell scripts and
+other CI systems, Codecov / Coveralls status targets, Kover, scoverage, tarpaulin, SimpleCov) so an empty
+result reads as "none of these forms". A configured threshold proves the tool
+fails below it when coverage runs; whether CI runs coverage is the Layer 5 read.
+Stdlib plus `lib.doc_graph.is_excluded_path`. Tests: `tests/test_coverage_gate.py`.
+
 **`sibling_tests.py`**
 The one sibling-test resolver. Holds the test-file naming idioms (`<stem>_test`,
 `.test`, `.spec`, `_spec`, `test_<stem>`, `<stem>Test`, `<stem>Tests`, with a
@@ -913,11 +1447,12 @@ layered probe: `find_colocated_test` (beside the source or in an adjacent test
 directory), `sibling_test_match` (then a `tests/` / `test/` / `spec/` tree at any
 ancestor mirroring the source path, then a conventionally named test anywhere in
 the repository - a parallel tree such as `app/unit-tests/` or Dart's
-`test/unit/` - then a flat tree within two components),
+`test/unit/` - then a test file that imports the source (`import_credit.py`), then a flat
+tree within two components),
 and `has_sibling_test` (the yes/no/unknown verdict, dropping a flat-only match
 on a bare name more than one hot file shares). Three consumers read it and must
 agree in one run: the hotspot page's `Has test file` row
-(`assess_core._has_sibling_test`), the E2 test-to-code map
+(`run_wiki._has_sibling_test`), the E2 test-to-code map
 (`keyhole_signals._find_sibling_test`, co-location layer only, since E2 means
 co-located and co-committed), and the `test_focus` signal. The parallel-tree
 (basename) tier reads a `TestIndex` built once per run by `build_test_index`
@@ -932,6 +1467,32 @@ while the path probes see untracked files, and a helper named like a test
 (`test_utils.py`) can credit a lone `utils.py`. Imports `git_churn` and `doc_graph`;
 existence checks bounded to 16 ancestor levels; never raises.
 `tests/test_sibling_tests.py` pins the three-way agreement.
+
+**`import_credit.py`**
+The import tier of the sibling-test probe (issue #485): a source counts as having
+a test file when a test file imports it, so a large test split by concern
+(`test_keyhole_<family>.py`, none named after `keyhole_signals.py`) still credits
+its subject. Reads only files that are tests by name and define a test (a
+top-level `test*` function, or a `Test*` class, `*TestCase` subclass or class
+with `test*` methods; an `it(` / `test(` / `describe(` call outside a
+line-leading comment), so a `conftest.py`, a helper module, or a `test_utils.py` that defines no
+test credits nothing. Python is parsed with `ast`: absolute names credit the
+source whose module path ends with the name (closest unique source to the test;
+a one-part name needs a common directory below the root unless the module sits
+at the root, and a one-part standard-library name such as `json` - from a pinned
+union over CPython 3.10-3.14 - never credits), relative imports resolve exactly, and `from pkg import mod` names
+`pkg/mod.py` when it exists, else `pkg/__init__.py`. JS/TS is a regex over
+relative specifiers only (`import ... from`, `export ... from`, side-effect and
+dynamic `import`, `require`; `import type` and line-leading comments skipped;
+string literals are not parsed; a NodeNext `./foo.js` specifier also resolves to
+`foo.ts`); alias and package
+specifiers keep the name match, as do all other languages. Modules inside a test
+directory are support, never credited. Every module a qualifying test imports
+directly is credited. Runs lazily, once per `TestIndex`, over the index's test
+and source lists (so the same excludes and tracked-files rule apply), capped at
+10,000 test files of at most 1 MB in sorted order (measured: 0.2 s for this
+repo's 110 tests; 0.05 s for 272 TS tests in a 4,600-file monorepo). Stdlib only; never raises.
+Tests: `tests/test_import_credit.py`.
 
 **`test_focus.py`**
 Cross-joins four inputs - the hotspot risk band (position in
@@ -975,22 +1536,71 @@ Layer 1 write-side truth pressure. Two tiers:
   place and is two-step - `mutmut run` then `mutmut junitxml` - because the run's stdout
   lists only survivors (no totals); the junitxml report carries every mutant, so per-file
   killed/survived/total (and a real survivor density) can be derived, falling back to the
-  survivor-only stdout parse when junitxml is empty. **mutmut 3** takes no paths and reads
-  its scope from the root `pyproject.toml` (`[tool.mutmut]`) or `setup.cfg` (`[mutmut]`),
-  so `_run_mutmut3` copies the working tree to a scratch directory, appends a generated
-  `[mutmut]` section unless mutmut 3 would find one of those two (a nested config or a CI
-  workflow naming mutmut does not count), runs there, and reads per-file totals from
-  `mutants/**/*.meta` using the exit-code table of mutmut 3.6.0. The generated section
-  sets `source_paths` and `paths_to_mutate` (3.0-3.5 read only the latter) to the focus
-  files' top-level directories and `only_mutate` (3.6+) to the focus files. Only the focus
-  files are reported whichever config governed the run, so the result's `scope` names the
-  files its figures describe. The copy spends the same `MUTATION_TIMEOUT` budget as the
-  run. On this path the assessed tree is never written to. A version neither probe can
+  survivor-only stdout parse when junitxml is empty. **mutmut 3** takes no paths, reads its
+  config from `[tool.mutmut]` in `pyproject.toml` or `[mutmut]` in `setup.cfg` of the
+  directory it runs in, copies only `source_paths` (plus `also_copy` and a few defaults)
+  into `mutants/`, and runs the suite from there. Its adapter, `test_pressure/mutmut3.py`,
+  groups the focus files by package root (the nearest directory holding `pyproject.toml`,
+  `setup.cfg` or `setup.py`, else the repository root) and runs mutmut once per group,
+  from that root, in a fresh scratch copy of the working tree. The copy keeps a tracked
+  link only when it points inside the repository (recreated relative); a link out of it
+  has a file target copied as content and a directory target left out, so no suite can
+  write through the copy into the assessed tree. A package whose config
+  mutmut 3 can read runs under it unchanged (its `source_paths`, `also_copy`,
+  `pytest_add_cli_args`), after a check that its `source_paths` exist in the copy and
+  cover a focus file: a path made at run time (a link CI creates, a generated tree) is
+  named in the group's `reason` and not recreated. Focus paths are matched through a
+  `source_paths` link (`scripts/lib/x.py` is `src/lib/x.py` under this repo's config), and
+  `mutmut run` is given the in-scope files' mutant-name patterns (`lib.x.*`), so the time
+  box is spent on the focus files rather than everything the config covers; the config
+  and its test selection, and so every verdict, are unchanged. A focus file the config
+  does not cover is listed in the group's `unmeasured`. Any other
+  package gets a generated `[mutmut]` section: `source_paths` and `paths_to_mutate`
+  (3.0-3.5 read only the latter) set to the focus files' top-level entries, `only_mutate`
+  (3.6+) to the files, and `also_copy` to the package's other entries, so `mutants/`
+  stands in for the package. Because the suite then runs one level deeper than in the
+  repository, `_mirror_ancestors` copies each ancestor's entries one level down in the
+  scratch copy (the parent's into the package, and so on), so a test that climbs
+  `Path(__file__).parents[n]` to a repository file still finds it. The copy is then
+  committed to a fresh git repository (user config, hooks and signing kept out), so a test
+  that asks git about `HEAD` sees the copied tree. Per-file totals come from
+  `mutants/**/*.meta` using the exit-code table of mutmut 3.6.0, mapped back to
+  repo-relative paths. Only the focus files are reported whichever config governed a run,
+  so the result's `scope` names the files its figures describe. `groups` records each
+  package's run (`root`, `config` of `repo` or `generated`, `scope`, `runner`, `mutation_run`, a
+  `reason` when it could not run, and `unmeasured` focus files when it ran without them), surfaced as `test_pressure.mutation_groups`; the pass
+  counts as run when any group recovered records. Every group draws on one `MUTATION_TIMEOUT` budget: the
+  snapshot and the run are bounded by what remains, and a copy (not interruptible) is
+  checked against the deadline before and after, so a later group can record a timeout
+  without copying. mutmut 3 saves each verdict to its `.meta` as it lands, so a run stopped
+  at the budget keeps the mutants it tested: the group reports them with `partial: true`
+  and a `reason` saying the figures cover only the mutants tested before the stop (mutmut
+  tests the fastest first), and records a timeout only when no focus-file verdict was
+  saved. On this path the
+  assessed tree is never written to. A version neither probe can
   read takes the mutmut 2 path, which runs in the assessed repo and leaves mutmut's
   `.mutmut-cache` there. Whichever path runs, a tool that exits non-zero without yielding mutants
-  puts the last line of its error output in the result's `reason` (surfaced as
-  `mutation_note`). mutmut runs pytest under its own interpreter, so a repo whose tests
-  need packages that interpreter lacks fails at mutmut's clean-test step and reports that
-  reason.
+  puts the last line of its error output (skipping Python warning lines, such as
+  mutmut's `paths_to_mutate` deprecation) in the result's `reason` (surfaced as
+  `mutation_note`), and the mutmut 3 path appends `; first failure:` with the first
+  import error, else pytest's first failing test, scratch and home paths labelled. mutmut
+  runs pytest under the interpreter that launches it, so `_resolve_runner` picks one that
+  can import the suite's dependencies (`runner`): a package `.venv` / `venv` that already
+  holds mutmut 3 (read only, no bytecode written), else `uv run --project` with
+  `UV_PROJECT_ENVIRONMENT` in the temp dir plus the pinned `mutmut==3.8.0` and pytest (for
+  a `pyproject.toml` with a `[project]` table; no optional extras), else the `mutmut` on
+  PATH.
+  This repo dogfoods the tier: `[tool.mutmut]` in `skills/assess/pyproject.toml` scopes
+  mutmut 3 to six core modules (`stats_diff`, `promissory_markers` and its
+  `python_regions` helper, `doc_staleness`, `doc_graph` and `keyhole_signals`, per
+  `only_mutate`) and `.github/workflows/mutation.yml` runs it weekly,
+  scoring per module with `_parse_mutmut3_meta`, so CI and `/assess` count mutants alike.
+  That config and workflow are also what `detect_mutation_config` credits on this repo.
+  That config mutates through `skills/assess/src`, a committed symlink to `scripts`, so the
+  opt-in pass runs it as checked out for the `skills/assess` group, while `scripts/` (no
+  mutmut config) runs under a generated section. The walks do not descend the link, and
+  the treemap keys files by resolved path, so the linked files are never counted twice. The shared walks
+  (`doc_graph`, `structure_graph`, the treemap) skip `mutants/`, so a tree a local run
+  leaves behind is never scored.
 - Cheap heuristics: test/source ratio, assertion density, and the coverage gap signal -
   fast proxies that run without a mutation tool.

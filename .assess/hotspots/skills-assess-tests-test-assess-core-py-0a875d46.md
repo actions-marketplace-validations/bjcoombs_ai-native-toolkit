@@ -1,28 +1,37 @@
-<!-- assess:run_id=20260919114544-b4104782 artifact_schema_version=1.1.0 -->
+<!-- assess:run_id=20261011125246-0d249381 artifact_schema_version=1.4.0 -->
 # Hotspot: `skills/assess/tests/test_assess_core.py`
 
-_First flagged: 2026-05-31. Last seen: 2026-09-19. Status: regressed._
+_First flagged: 2026-05-31. Last seen: 2026-10-11. Status: persistent._
 
 ## Current metrics
 
 | Metric | Value |
 |--------|-------|
-| LOC | 1644 |
-| Cyclomatic complexity (file max) | 200.0 |
-| Commits in churn window | 36 |
+| LOC | 518 |
+| Cyclomatic complexity (file aggregate) | 62 |
+| Worst function | `_gap_repo` (6) |
+| Commits in churn window | 46 |
 | Has test file | yes |
 
 ## History across runs
 
-| Run date | LOC | CCN | Commits | Status |
-|----------|-----|-----|---------|--------|
-| 2026-09-19 | 1644 | 200.0 | 36 | regressed |
+| Run date | Run | LOC | CCN | Commits | Status |
+|----------|-----|-----|-----|---------|--------|
+| 2026-09-19 | - | 1644 | 200.0 | 36 | regressed |
+| 2026-10-07 | f520a0c5 | 1819 | 236 | 39 | regressed |
+| 2026-10-07 | e950cb1b | 1843 | 240 | 41 | regressed |
+| 2026-10-07 | 4ace52ea | 1843 | 240 | 42 | persistent |
+| 2026-10-08 | 417634ee | 1853 | 241 | 43 | regressed |
+| 2026-10-08 | d0c68d2e | 518 | 62 | 45 | persistent |
+| 2026-10-08 | de900b5c | 518 | 62 | 45 | persistent |
+| 2026-10-08 | 32cb78d4 | 518 | 62 | 45 | persistent |
+| 2026-10-11 | 0d249381 | 518 | 62 | 46 | persistent |
 
 ## Briefing for editing this file
 
 Use this briefing when about to modify `skills/assess/tests/test_assess_core.py`:
 
-Hotspot (regressed). 1644 LOC, max cyclomatic complexity 200.0, 36 commits in churn window. Carries 4 stale promissory marker(s) (suppression, todo; oldest survived 31 edits to this file). (Briefing refined by LLM via assess_finalize - see Suggested actions below.)
+Hotspot (persistent). 518 LOC, aggregate cyclomatic complexity 62 (worst function `_gap_repo` 6), 46 commits in churn window. (Briefing refined by LLM via assess_finalize - see Suggested actions below.)
 
 ## Suggested actions
 

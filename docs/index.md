@@ -1,14 +1,13 @@
 # Map of Content
 
-The navigation index for `ai-native-toolkit`. Every shipped doc in this repo is reachable from here by following links - no directory-walking required. Start at the [README](../README.md) for the project overview, the [CLAUDE.md](../CLAUDE.md) contract for the rules that govern edits, then use the trails below to reach any agent, command, or skill.
+The navigation index for `ai-native-toolkit`. Every shipped doc in this repo is reachable from here by following links - no directory-walking required. The public landing page is the [GitHub Pages site](https://bjcoombs.github.io/ai-native-toolkit/), served as-is from `docs/index.html`. Start at the [README](../README.md) for the project overview, the [CLAUDE.md](../CLAUDE.md) contract for the rules that govern edits, then use the trails below to reach any agent or skill.
 
 ## Subtrees at a glance
 
 | Subtree | Entry doc | What lives there |
 |---------|-----------|------------------|
-| Skills | [`skills/`](../skills/README.md) | The plugin's skills - the headline `/assess`, `/huddle`, `/deslop`, `/skill-forge`, `/semantic-compress`, plus `/ghsync` and the team-orchestration library skills |
-| Commands | [`commands/`](../commands/README.md) | Slash commands - portable framework commands and opt-in personal workflow commands |
-| Agents | [`agents/`](../agents/README.md) | The Six Thinking Hats team that `/huddle` and `/6hats` orchestrate |
+| Skills | [`skills/`](../skills/README.md) | The plugin's skills - the headline `/assess`, `/huddle`, `/deslop`, `/skill-forge`, `/semantic-compress`, plus `/ghsync`, the user-invoked workflows (`/tm`, `/issues`, `/fix-pr`, ...) and the team-orchestration library skills |
+| Agents | [Agents](#agents) below | The Six Thinking Hats team that `/huddle` and `/6hats` orchestrate, plus `/assess`'s layer scorer |
 | Docs | this file | Design history, runbooks, and the rendered example SVGs |
 
 ## Skills
@@ -20,13 +19,17 @@ Portable (work in any Claude Code session, also shipped as standalone ZIPs):
 - [`/assess`](../skills/assess/SKILL.md) - score a codebase's readiness for AI agent contributors against the 0-8 layered contract model; emits a complexity hotspot SVG and a doc-navigability graph SVG.
 - [`/huddle`](../skills/huddle/SKILL.md) - structured multi-perspective deliberation using Six Thinking Hats with Fibonacci team sizing.
 - [`/deslop`](../skills/deslop/SKILL.md) - detect and remove the telltale signs of AI writing. Ships an exhaustive [reference checklist](../skills/deslop/references/full-checklist.md).
-- [`/ghsync`](../skills/ghsync/SKILL.md) - bulk-clone and fast-forward sync every GitHub repo you can access across an org.
 - [`/skill-forge`](../skills/skill-forge/SKILL.md) - harden a skill through judge-panel refinement rounds to a 3-tier promotion gate; refined through its own process. Composes the `ab-equivalence` runner for its behavioural equivalence gate.
 - [`/semantic-compress`](../skills/semantic-compress/SKILL.md) - optimize LLM-directed instructions while preserving behaviour. Two transforms in one family: **compress** (a local span-level core->pointer pass + an A/B-validated distill loop that produces the smallest behaviourally-equivalent version of a whole document or skill) and **directive-clarity** (rewrites latent-action instructions - bare negations, facts-not-actions, vague pointers - into directives that name the action, validated by a measured directness gain at zero regression). Both transforms compose `ab-equivalence` for the behavioural test. Directive-clarity design docs: [cognitive-ergonomics frame](../skills/semantic-compress/references/cognitive-ergonomics.md), [detection patterns](../skills/semantic-compress/references/directive-clarity-patterns.md), [battle-scar classifier](../skills/semantic-compress/references/battle-scar-classifier.md), [rewrite rules](../skills/semantic-compress/references/directive-clarity-rewrites.md).
 
-Team-orchestration library skills (invoked by the workflow commands, not standalone):
+Plugin-only (Claude Code, no standalone ZIP):
 
-- [`marathon`](../skills/marathon/SKILL.md) - parallel agent marathon orchestration: DAG analysis, waves, crash recovery, retrospective.
+- [`/ghsync`](../skills/ghsync/SKILL.md) - bulk-clone and fast-forward sync every GitHub repo you can access across an org.
+- [`/ghreport`](../skills/ghreport/SKILL.md) - read-only org repo state report: open PRs, default-branch CI, security alerts and branch protection per repo, reusing `/ghsync`'s repo discovery.
+
+Team-orchestration library skills (invoked by the workflow skills, not standalone):
+
+- [`marathon`](../skills/marathon/SKILL.md) - parallel agent marathon orchestration: DAG analysis, waves, crash recovery, retrospective. Its [forge report](../skills/marathon/forge/forge-report.md) is a real `/skill-forge` run output, kept as a worked example.
 - [`pr-review-merge`](../skills/pr-review-merge/SKILL.md) - the PR review-to-green loop plus smart merge.
 - [`ab-equivalence`](../skills/ab-equivalence/SKILL.md) - A/B behavioural equivalence testing: given two document versions and a transfer set, judges per-case equivalence. Composed by `skill-forge` and `semantic-compress`.
 
@@ -34,28 +37,34 @@ Team-orchestration library skills (invoked by the workflow commands, not standal
 
 - [`assess`](../skills/assess/SKILL.md) - the orchestrator and layered scorer.
 - [`assess-findings`](../skills/assess-findings/SKILL.md) - renders the report from the deterministic `run-context.json` and the layer scorecard.
-- [`assess-pr`](../skills/assess-pr/SKILL.md) - the end-of-run offers (open a PR, track the Top 3 Actions, freeze a CI gate).
+- [`assess-pr`](../skills/assess-pr/SKILL.md) - the end-of-run offers (open a PR, track the Top 3 Actions, freeze a CI gate), including the [uninstall steps](../skills/assess/references/uninstall.md) that remove what a run wrote.
 
-## Commands
+The deterministic core's per-module reference is [`skills/assess/scripts/lib/README.md`](../skills/assess/scripts/lib/README.md); its test suites are mapped to the modules they pin in [`skills/assess/tests/README.md`](../skills/assess/tests/README.md).
 
-The slash commands, indexed in [`commands/README.md`](../commands/README.md).
+The hotspot score's formula, and why a co-change breadth term was tested and left out, is recorded in the [co-change experiment note](../skills/assess/references/hotspot-cochange-experiment.md).
+
+## User-invoked skills
+
+Slash-command-only skills (`disable-model-invocation: true`): Claude never loads them on its own, only when you type the command. Indexed in [`skills/README.md`](../skills/README.md#user-invoked).
 
 Portable:
 
-- [`/6hats`](../commands/6hats.md) - solo Six Hats analysis, an alias for `/huddle` at team size 1.
-- [`/understand`](../commands/understand.md) - deep understanding mode (nemawashi): exhaustive context-gathering before action.
+- [`/6hats`](../skills/6hats/SKILL.md) - solo Six Hats analysis, an alias for `/huddle` at team size 1.
+- [`/understand`](../skills/understand/SKILL.md) - deep understanding mode (nemawashi): exhaustive context-gathering before action.
 
-Personal workflow commands (opt-in - see [Adapting for your workflow](../README.md#adapting-for-your-workflow)):
+Personal workflows (opt-in - see [Adapting for your workflow](../README.md#adapting-for-your-workflow)):
 
-- [`/tm`](../commands/tm.md) - Task Master orchestration: starts, reviews, or cleans up tasks by current state.
-- [`/issues`](../commands/issues.md) - GitHub-issue marathon: triage open issues, then run agent-ready ones to merge with Agent Teams.
-- [`/fix-pr`](../commands/fix-pr.md) - autonomous PR fixing loop: iterates on CI failures and review comments until green.
-- [`/fix-develop`](../commands/fix-develop.md) - autonomous fix loop for failing CI on the default branch.
-- [`/tm-marathon-config-example`](../commands/tm-marathon-config-example.md) - reference configuration block for marathon-mode `/tm` and `/issues`.
+- [`/tm`](../skills/tm/SKILL.md) - Task Master orchestration: starts, reviews, or cleans up tasks by current state.
+- [`/issues`](../skills/issues/SKILL.md) - GitHub-issue marathon: triage open issues, then run agent-ready ones to merge with Agent Teams.
+- [`/fix-pr`](../skills/fix-pr/SKILL.md) - autonomous PR fixing loop: iterates on CI failures and review comments until green.
+- [`/fix-develop`](../skills/fix-develop/SKILL.md) - autonomous fix loop for failing CI on the default branch.
+- [`/tm-marathon-config-example`](../skills/tm-marathon-config-example/SKILL.md) - reference configuration block for marathon-mode `/tm` and `/issues`.
 
 ## Agents
 
-The Six Thinking Hats team, indexed in [`agents/README.md`](../agents/README.md):
+Subagent definitions under `agents/`, invoked by the skills or directly via `Agent(subagent_type=...)`. Claude Code loads every `.md` in `agents/` as an agent, so this list is the catalog and `agents/` holds agent files only. Each carries the frontmatter contract (`name`, `description`, `model`, `color`) documented in [`CLAUDE.md`](../CLAUDE.md).
+
+The Six Thinking Hats team, orchestrated by [`/huddle`](../skills/huddle/SKILL.md) and [`/6hats`](../skills/6hats/SKILL.md), and `/assess`'s scorer:
 
 - [`white-hat`](../agents/white-hat.md) - facts and evidence.
 - [`red-hat`](../agents/red-hat.md) - gut feelings and emotional drivers.
@@ -66,8 +75,22 @@ The Six Thinking Hats team, indexed in [`agents/README.md`](../agents/README.md)
 - [`scribe`](../agents/scribe.md) - structures hat output into actionable documentation.
 - [`assess-layer-scorer`](../agents/assess-layer-scorer.md) - scores a codebase against the `/assess` layered contract model.
 
+## Acceptance-contract workflow
+
+- [`FLOOR.md`](../FLOOR.md) - the constitutional floor: four clauses no automated step may rewrite, enforced by the required `floor enforcement` and `floor self-anchor` checks. Floor changes need the maintainer's out-of-band `floor-signoff` approval.
+- [External-anchor proof](./floor-anchor-proof.md) - why the floor checks cannot be silently disarmed.
+- [Acceptance contract verification](../skills/README.md#acceptance-contract-verification) - the map of the gates, from start gate to complete gate.
+- [Readiness check prompt](../scripts/contract/readiness_check_prompt.md) - the fixed prompt for the one-pass, document-only readiness check.
+- [Canary fixtures](../tests/canaries/README.md) - the contract-file format and the ground-truth fixtures the canary harness runs: `known-good` ([spec](../tests/canaries/known-good/spec.md), [contract](../tests/canaries/known-good/contract.md), [expected result](../tests/canaries/known-good/expected_result.md)), `known-good-interactive` ([spec](../tests/canaries/known-good-interactive/spec.md), [contract](../tests/canaries/known-good-interactive/contract.md), [expected result](../tests/canaries/known-good-interactive/expected_result.md)), `vacuous-contract` ([spec](../tests/canaries/vacuous-contract/spec.md), [contract](../tests/canaries/vacuous-contract/contract.md), [expected result](../tests/canaries/vacuous-contract/expected_result.md)) and `jet-fighters` ([PRD](../tests/canaries/jet-fighters/prd.md), [contract](../tests/canaries/jet-fighters/contract.md), [expected result](../tests/canaries/jet-fighters/expected_result.md)).
+
 ## Docs
 
+- [Contributing: north star](./contributing/north-star.md) - the goal every skill and report serves, the three contributor tendencies the guardrails trace to, and the feature test for any change.
+- [Contributing: CI and merge gates](./contributing/ci.md) - workflows, branch protection, the type gate, the file-size ratchet, the floor, mutation testing, CodeQL and the coverage floor.
+- [Contributing: marathon notes](./contributing/marathon.md) - the reasoning behind the `## Marathon Configuration` values in `CLAUDE.md`: bot reviewers, the claude-review four-state rule, non-blocking checks, the version hot file.
+- [Contributing: releasing](./contributing/release.md) - cutting the per-marathon release and refreshing the Marketplace listing.
+- [Contributing: standalone skill pipeline](./contributing/standalone-skills.md) - how the standalone ZIPs are built, vendored and marker-transformed.
+- [Contributing: /assess architecture](./contributing/assess-architecture.md) - the deterministic core, the inward-only layering, the `.assess/` wiki and the LLM write-back.
 - [Testing a branch locally](./testing-a-branch-locally.md) - run an unmerged branch's `SKILL.md` and scripts as a real plugin against a target repo.
 - [Design history](./superpowers/README.md) - the plans and specs behind the skills as they were built.
 - [Modernization programme (2026-09)](./design/2026-09-modernization/README.md) - intent, recorded probes, and the eleven workstream specs behind the multi-plugin split.

@@ -2,11 +2,13 @@
 
 [![AI-readiness](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbjcoombs%2Fai-native-toolkit%2Fmain%2F.assess%2Fbadge.json)](.assess/assess-report.md) [![Assess Gate](https://github.com/bjcoombs/ai-native-toolkit/actions/workflows/assess-gate.yml/badge.svg)](https://github.com/bjcoombs/ai-native-toolkit/actions/workflows/assess-gate.yml)
 
-A Claude Code plugin - and a set of standalone skills for **any AI assistant**: skills, agents, and commands for AI-native development. In Claude Code it runs locally against your own codebase using whichever model you already pay for. Several of the skills also ship as standalone [Agent Skills](https://www.anthropic.com/news/skills) ZIPs you can upload to claude.ai, Claude Desktop, Cowork, or any assistant that supports the skills format - no Claude Code required.
+A Claude Code plugin - and a set of standalone skills for **any AI assistant**: skills and agents for AI-native development. In Claude Code it runs locally against your own codebase using whichever model you already pay for. Several of the skills also ship as standalone [Agent Skills](https://www.anthropic.com/news/skills) ZIPs you can upload to claude.ai, Claude Desktop, Cowork, or any assistant that supports the skills format - no Claude Code required.
 
 > **Want the skills without Claude Code?** Download the ZIPs from the **[latest release](https://github.com/bjcoombs/ai-native-toolkit/releases/latest)** - the release notes link straight to that version's standalone skill bundle - and upload them in your assistant's Skills UI. Full walkthrough: [Standalone skill ZIPs](#standalone-skill-zips-any-ai-assistant). Currently standalone: `/assess`, `/huddle`, `/deslop`, `/skill-forge`, `/semantic-compress`.
 
-> **New here?** The [Map of Content](docs/index.md) is the navigation index - one trail to every skill, command, agent, and design doc in this repo. The [`CLAUDE.md`](CLAUDE.md) contract holds the rules for editing it.
+> **Project site:** a one-page tour of the toolkit lives at https://bjcoombs.github.io/ai-native-toolkit/.
+
+> **New here?** The [Map of Content](docs/index.md) is the navigation index - one trail to every skill, agent, and design doc in this repo. The [`CLAUDE.md`](CLAUDE.md) contract holds the rules for editing it.
 
 > **Here from the GitHub Marketplace?** You found the **AI-Readiness Assess Gate** - the CI-gate half of this toolkit. It runs the same deterministic engine the `/assess` skill uses (complexity treemap, promissory-marker scan, doc-graph signals - zero AI tokens) on every pull request and gates on what your `.assess/config.toml` opts into. Jump straight to [Use as a GitHub Action](#use-as-a-github-action); the rest of this README covers the full plugin the action is carved from.
 
@@ -20,7 +22,7 @@ There's a second half, and it's the same ethic pointed the other way. When a con
 
 The headline pieces are five **skills**:
 
-- **`/assess`** - score any codebase's readiness for AI agent contributors against an 8-layer contract model (navigability, runtime liveness, code design, linters, architecture tests, CI, coverage, review bots, AI project management), with a Codecov-style complexity hotspot SVG and a doc-navigability graph SVG (both colour-blind-safe). Generates a report + the two SVGs and opens a PR in the target repo.
+- **`/assess`** - score any codebase's readiness for AI agent contributors against a 9-layer (0-8) contract model (navigability, runtime liveness, code design, linters, architecture tests, CI, coverage, review bots, AI project management), with a Codecov-style complexity hotspot SVG and a doc-navigability graph SVG (both colour-blind-safe). Generates a report + the two SVGs and opens a PR in the target repo.
 - **`/huddle`** - structured multi-perspective deliberation using Six Thinking Hats with Fibonacci team sizing (solo -> debate -> huddle -> panel -> board). See it in action: a [narrated visual explainer](https://bjcoombs.github.io/ai-native-toolkit/huddle-explainer/visualization.html), and the [repeatable pipeline](./docs/huddle-explainer/README.md) used to build it.
 - **`/deslop`** - detect and remove the telltale signs of AI writing (puffery, the rule of three, "not X but Y", filler diction, chatbot leakage, fabricated citations). Runs as a silent quality gate while writing, or as an explicit audit/edit pass. Derived from Wikipedia's "Signs of AI writing".
 - **`/skill-forge`** - harden a skill (draft or existing) through judge-panel refinement rounds until it clears a strict 3-tier promotion gate. A prove-and-promote quality gate that runs after authoring, built on the same team-lead pattern as `/huddle` - and proven by forging itself.
@@ -134,10 +136,10 @@ The assess gate ships as a composite GitHub Action ([Marketplace listing](https:
 
 ```yaml
 steps:
-  - uses: actions/checkout@v6
+  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
     with:
       fetch-depth: 0   # full history so the churn window is accurate
-  - uses: bjcoombs/ai-native-toolkit@v1.42.2
+  - uses: bjcoombs/ai-native-toolkit@v1.92.0
     with:
       config: .assess/config.toml   # optional; warn-only defaults without it
 ```
@@ -149,9 +151,9 @@ Two badges come with it - GitHub's native status badge for the gate workflow, an
 ![AI-readiness](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F<owner>%2F<repo>%2F<branch>%2F.assess%2Fbadge.json)
 ```
 
-Warn-only by default: the only thing that can fail a PR is what `.assess/config.toml` opts into (`fail_on` findings, complexity floors, `fail_on_regression`). Because the version rides a `uses:` pin on an immutable release tag, **Dependabot and Renovate detect new toolkit releases and open upgrade PRs automatically** - add a `.github/dependabot.yml` with the `github-actions` ecosystem and the gate keeps itself current. The `/assess` end-of-run "freeze into CI" offer emits exactly this workflow.
+Warn-only by default: the only thing that can fail a PR is what `.assess/config.toml` opts into (`fail_on` findings, complexity floors, `fail_on_regression`). Because the version rides a `uses:` pin on an immutable release tag, **Dependabot and Renovate detect new toolkit releases and open upgrade PRs automatically** - add a `.github/dependabot.yml` with the `github-actions` ecosystem and the gate keeps itself current. The `/assess` end-of-run "freeze into CI" offer emits this workflow, with actions pinned to commit SHAs and the toolkit pinned to the newest published tag.
 
-> **Portability split.** The framework pieces (`/assess`, `/huddle`, `/deslop`, `/skill-forge`, `/semantic-compress`, `/6hats`, `/understand` and their agents) are portable and work in any Claude Code session. The workflow commands (`/tm`, `/fix-pr`, `/fix-develop`) bake in one author's daily setup: a `<repo>-main/` + `worktree/` layout, GitHub + `gh` CLI, Task Master, CodeRabbit/claude[bot] review threads, and the Agent Teams capability flag. See [Adapting](#adapting-for-your-workflow) before relying on them in a different setup.
+> **Portability split.** The framework pieces (`/assess`, `/huddle`, `/deslop`, `/skill-forge`, `/semantic-compress`, `/6hats`, `/understand` and their agents) are portable and work in any Claude Code session. The workflow commands (`/tm`, `/issues`, `/fix-pr`, `/fix-develop`) bake in one author's daily setup: a `<repo>-main/` + `worktree/` layout, GitHub + `gh` CLI, Task Master, CodeRabbit/claude[bot] review threads, and the Agent Teams capability flag. See [Adapting](#adapting-for-your-workflow) before relying on them in a different setup.
 
 ## Install
 
@@ -267,25 +269,28 @@ Full catalog and per-skill base docs: [`skills/README.md`](skills/README.md).
 |-------|-------------|
 | `/assess` | Layered AI-readiness assessment (0-8 contract model) plus a Codecov-style complexity hotspot SVG and a doc-navigability graph SVG (both colour-blind-safe). Ships [`complexity-treemap.py`](skills/assess/scripts/complexity-treemap.py) and [`doc-graph-svg.py`](skills/assess/scripts/doc-graph-svg.py) so the agent runs them with no external setup. Filters build artifacts and generated code by default (opt-out with `--include-artifacts`); warns when one file dominates LOC. Offers to install optional `scc` for repos heavy in markdown/JSON/YAML. Generated PRs include a self-install footer so reviewers can adopt the plugin. |
 | `/huddle` | Multi-perspective deliberation using Six Thinking Hats with Fibonacci team sizing (solo -> debate -> huddle -> panel -> board). Three execution modes: solo flat-parallel, phased sub-agent (default fallback), and team mode (needs Agent Teams capability flag). |
-| `/deslop` | Detect and remove the telltale signs of AI writing - puffery, the rule of three, "not X but Y", filler diction, chatbot leakage, fabricated citations. Two modes: a silent quality gate while writing prose, or an explicit de-slop/audit pass. Ships a [`references/full-checklist.md`](skills/deslop/references/full-checklist.md) A-F catalog derived from Wikipedia's "Signs of AI writing" (29 May 2026) - the skill flags itself for re-derivation if it goes stale, since the tells drift with model generations. |
-| `/ghsync` | Bulk clone and keep in sync every GitHub repo you can access across an org - built for onboarding into a new enterprise. Discovers repos through the teams you belong to, deduplicates, then clones new ones and fast-forward syncs existing checkouts and their worktrees into a `<repo>/<repo>-main` + `<repo>/worktree` layout. Org defaults to the directory you run from. Never clobbers local work (uncommitted or off-default-branch repos are fetched, not pulled) and reports every exception in a summary. Ships [`ghsync.sh`](skills/ghsync/scripts/ghsync.sh); needs `gh` + `jq`, supports GitHub Enterprise via `GH_HOST`. |
+| `/deslop` | Detect and remove the telltale signs of AI writing - puffery, the rule of three, "not X but Y", filler diction, chatbot leakage, fabricated citations. Two modes: a silent quality gate while writing prose, or an explicit de-slop/audit pass. Ships a [`references/full-checklist.md`](skills/deslop/references/full-checklist.md) A-F catalog derived from Wikipedia's "Signs of AI writing" (revision of 14 September 2026) - the skill flags itself for re-derivation if it goes stale, since the tells drift with model generations. |
+| `/ghsync` | Bulk clone and keep in sync every GitHub repo you can access across an org - built for onboarding into a new enterprise. For an org, unions the repos reachable through your teams with the org's repo list (so direct-collaborator and public repos count); for a personal account, uses the account's repo list. Deduplicates, then clones new ones and fast-forward syncs existing checkouts and their worktrees into a `<repo>/<repo>-main` + `<repo>/worktree` layout. Org defaults to the directory you run from. Never clobbers local work (uncommitted or off-default-branch repos are fetched, not pulled) and reports every exception in a summary. Ships [`ghsync.sh`](skills/ghsync/scripts/ghsync.sh); needs `gh` + `jq`, supports GitHub Enterprise via `GH_HOST`. |
 | `/ghreport` | Read-only org repo state report. Reuses `/ghsync`'s repo discovery but, instead of cloning, queries each repo's remote GitHub state - open PRs, CI on the default branch, open security alerts (Dependabot / code-scanning / secret-scanning), and branch protection - and rolls it into a terminal summary plus a timestamped markdown file. Endpoints needing admin that return 403/404 are reported as no-access / unknown, never as a clean zero. Needs `gh` + `jq`. |
-| `/semantic-compress` | Optimize an LLM-directed document while preserving what it does, gated on `/skill-forge`'s A/B equivalence harness. Two transforms in one optimizer family: **compress** (a local core->pointer pass plus an A/B-validated distill loop producing the smallest behaviourally-equivalent document) and **directive-clarity** (rewrites latent-action instructions - bare negations, facts-not-actions, vague pointers - into directives that name the action, validated by a measured directness gain at zero regression). Both rest on a [cognitive-ergonomics](skills/semantic-compress/references/cognitive-ergonomics.md) frame whose claims are hypotheses the harness measures, never asserts. |
+| `/semantic-compress` | Optimize an LLM-directed document while preserving what it does, gated on the `ab-equivalence` library skill's A/B harness. Two transforms in one optimizer family: **compress** (a local core->pointer pass plus an A/B-validated distill loop producing the smallest behaviourally-equivalent document) and **directive-clarity** (rewrites latent-action instructions - bare negations, facts-not-actions, vague pointers - into directives that name the action, validated by a measured directness gain at zero regression). Both rest on a [cognitive-ergonomics](skills/semantic-compress/references/cognitive-ergonomics.md) frame whose claims are hypotheses the harness measures, never asserts. |
+| `/skill-forge` | Harden a skill or agent instruction file (`CLAUDE.md`, `AGENTS.md`, ...) through judge-panel refinement rounds until it clears a 3-tier promotion gate, then promote it. |
 
-### Commands (slash-only, no bundled assets)
+Also auto-discovered, but not invoked directly: the library skills `marathon`, `pr-review-merge` and `ab-equivalence`, and the `/assess` render-time helpers `assess-findings` and `assess-pr`.
 
-Full catalog: [`commands/README.md`](commands/README.md).
+### User-invoked skills (slash-command only)
+
+These set `disable-model-invocation: true`: Claude runs one only when you type it, never on its own. Full catalog: [`skills/README.md`](skills/README.md#user-invoked).
 
 Portable:
 
-| Command | Description |
+| Skill | Description |
 |---------|-------------|
 | `/6hats <question>` | Solo Six Hats analysis - alias for `/huddle` at team size 1 |
 | `/understand <thing>` | Deep understanding mode (nemawashi) - exhaustive context-gathering before action |
 
 Workflow (personal setup, opt-in - see [Adapting](#adapting-for-your-workflow)):
 
-| Command | Description |
+| Skill | Description |
 |---------|-------------|
 | `/tm` | Task Master orchestration - context-aware: starts, reviews, or cleans up tasks based on current state |
 | `/issues` | GitHub-issue marathon - triage open issues (tag `agent-ready` or post clarifying questions), then run agent-ready ones to merge with Agent Teams; mirrors `/tm`'s plan-then-marathon flow |
@@ -293,11 +298,11 @@ Workflow (personal setup, opt-in - see [Adapting](#adapting-for-your-workflow)):
 | `/fix-pr` | Autonomous PR fixing loop - iterates on CI failures and review comments until green |
 | `/fix-develop` | Autonomous fix loop for failing CI on the repo's default branch |
 
-`/tm`, `/issues`, `/fix-pr`, and `/fix-develop` share the `marathon` skill (team orchestration engine: DAG analysis, waves, crash recovery, retrospective) and the `pr-review-merge` skill (review-to-green loop + smart merge) as a single source of truth. Each command supplies a thin work-source adapter; the skills own the execution.
+`/tm` and `/issues` share the `marathon` skill (team orchestration engine: DAG analysis, waves, crash recovery, retrospective); all four workflow skills share the `pr-review-merge` skill (review-to-green loop + smart merge) as a single source of truth. Each workflow supplies a thin work-source adapter; the skills own the execution.
 
-### Agents (invoked by skills, or directly via `Task(subagent_type=...)`)
+### Agents (invoked by skills, or directly via `Agent(subagent_type=...)`)
 
-Full catalog: [`agents/README.md`](agents/README.md).
+Full catalog: [Map of Content, Agents](docs/index.md#agents).
 
 The Six Hats team that `/huddle` and `/6hats` orchestrate:
 
@@ -310,6 +315,8 @@ The Six Hats team that `/huddle` and `/6hats` orchestrate:
 | `green-hat` | Creative alternatives |
 | `blue-hat` | Synthesis and recommendation |
 | `scribe` | Structures hat output into actionable documentation |
+
+`assess-layer-scorer` scores a codebase against the `/assess` 0-8 layered model from `run-context.json`, Present/Partial/Missing per layer with evidence (used by `/assess`).
 
 ## Why Six Hats?
 
@@ -332,15 +339,15 @@ What am I not considering? What's the lazy solution that might work?
 
 ## Adapting for your workflow
 
-The framework pieces (`/assess`, `/huddle`, `/6hats`, `/understand` and their agents) are reusable as-is. The workflow commands embed assumptions you will likely need to override:
+The framework pieces (`/assess`, `/huddle`, `/deslop`, `/skill-forge`, `/semantic-compress`, `/6hats`, `/understand` and their agents) are reusable as-is. The workflow skills embed assumptions you will likely need to override:
 
-- **Directory layout** - `commands/tm.md`, `commands/fix-pr.md`, `commands/fix-develop.md` all assume `~/dev/github.com/<org>/<repo>/<repo>-main/` + sibling `worktree/`. Edit the path patterns to match your structure.
-- **Default branch** - `/fix-develop` derives the branch via `gh repo view --json defaultBranchRef`. `/tm` uses a `$BASE_BRANCH` variable. Other commands may still reference `develop` in prose; check before relying on them on a `main`-default repo.
+- **Directory layout** - `skills/tm/SKILL.md`, `skills/issues/SKILL.md`, `skills/fix-pr/SKILL.md`, `skills/fix-develop/SKILL.md` all assume `~/dev/github.com/<org>/<repo>/<repo>-main/` + sibling `worktree/`. Edit the path patterns to match your structure.
+- **Default branch** - `/fix-develop` derives the branch via `gh repo view --json defaultBranchRef`. `/tm` uses a `$BASE_BRANCH` variable. Other workflow skills may still reference `develop` in prose; check before relying on them on a `main`-default repo.
 - **Required external tools** - `gh` CLI for GitHub, [Task Master](https://github.com/eyaltoledano/claude-task-master) for `/tm`, optional Agent Teams capability flag (`$CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`) for `/tm` marathon mode.
 - **Review-bot conventions** - PR-loop logic in `/tm`, `/fix-pr`, `/fix-develop` distinguishes CodeRabbit, claude[bot], and human threads. Adjust if your repo uses different bots.
 - **CLAUDE.md** - your global / project `CLAUDE.md` references to the directory structure need to match.
 
-### Git workflow assumed by `/tm`, `/fix-pr`, `/fix-develop`
+### Git workflow assumed by `/tm`, `/issues`, `/fix-pr`, `/fix-develop`
 
 ```text
 ~/dev/github.com/<org>/<repo>/
@@ -368,68 +375,45 @@ cd ../worktree/fix-login-bug
 ```text
 ai-native-toolkit/
 ├── README.md
+├── CLAUDE.md                          # Contract for agents editing this repo
+├── FLOOR.md                           # Constitutional floor of the acceptance-contract workflow
+├── .file-size-ratchet.toml            # Line limits for Python files: 800 by default, recorded ceilings for larger files
+├── action.yml                         # AI-Readiness Assess Gate composite action
+├── Makefile                           # make setup (locked uv environments), make check (the required CI checks)
 ├── .claude-plugin/
 │   ├── plugin.json                    # Plugin manifest (enables /plugin install)
 │   └── marketplace.json               # Marketplace entry (enables /plugin marketplace add)
-├── skills/
-│   ├── assess/
-│   │   ├── SKILL.md                   # Codebase readiness assessment + complexity hotspot
-│   │   └── scripts/
-│   │       └── complexity-treemap.py  # Codecov-style hotspot SVG generator
-│   ├── huddle/
-│   │   └── SKILL.md                   # Multi-lens Six Hats deliberation
-│   ├── deslop/
-│   │   ├── SKILL.md                   # Remove the signs of AI writing (12 high-frequency tells)
-│   │   └── references/
-│   │       └── full-checklist.md      # Exhaustive A-F catalog (Wikipedia-derived)
-│   ├── ghsync/
-│   │   ├── SKILL.md                   # Bulk clone + sync every org repo you can access
-│   │   └── scripts/
-│   │       └── ghsync.sh              # Org-wide clone + fast-forward sync into worktree layout
-│   ├── marathon/
-│   │   └── SKILL.md                   # Parallel agent marathon orchestration
-│   └── pr-review-merge/
-│       └── SKILL.md                   # PR review, iteration, and merge lifecycle
-├── commands/
-│   ├── tm.md
-│   ├── tm-marathon-config-example.md
-│   ├── 6hats.md
-│   ├── understand.md
-│   ├── fix-pr.md
-│   ├── fix-develop.md
-│   └── issues.md
-├── agents/
-│   ├── white-hat.md
-│   ├── red-hat.md
-│   ├── black-hat.md
-│   ├── yellow-hat.md
-│   ├── green-hat.md
-│   ├── blue-hat.md
-│   └── scribe.md
-├── scripts/                           # Standalone skill ZIP build pipeline
+├── .github/workflows/                 # assess-gate, build-standalone-skills, claude-review, codeql, floor, mutation, pr-lint, tests
+├── .assess/                           # This repo's own /assess wiki (report, heatmap, hotspots, log)
+├── skills/                            # One directory per skill - catalog in skills/README.md
+│   ├── assess/                        # SKILL.md, scripts/ (assess_core.py, lib/, renderers), references/, templates/, tests/
+│   ├── assess-findings/ assess-pr/    # /assess render-time helpers
+│   ├── huddle/ deslop/ skill-forge/ semantic-compress/
+│   ├── ghsync/ ghreport/              # SKILL.md + scripts/*.sh
+│   ├── 6hats/ understand/             # User-invoked framework skills
+│   ├── tm/ issues/ fix-pr/ fix-develop/ tm-marathon-config-example/   # User-invoked workflows
+│   └── marathon/ pr-review-merge/ ab-equivalence/   # Library skills
+├── agents/                            # Six Hats team + assess-layer-scorer (agent files only; catalog in docs/index.md)
+├── scripts/                           # Standalone ZIP build, floor checks, acceptance-contract gates
 │   ├── transform_skill.py             # Marker-based SKILL.md transformer
 │   ├── standalone_skill_config.py     # Per-skill config (names, descriptions, replacements)
 │   ├── build-standalone-skills.sh     # Build orchestrator
-│   ├── pyproject.toml
-│   └── tests/
-│       ├── test_transform.py          # Transformer unit tests
-│       └── test_integration.py        # Full-build ZIP content validation
+│   ├── floor_check.py floor_anchor.py # Floor enforcement and self-anchor
+│   ├── contract/ canaries/            # Acceptance-contract gates and canary harness
+│   └── tests/                         # pytest suite for the above
+├── tests/                             # Plugin contract tests, plus contract/ and canaries/
 ├── dist/                              # Generated ZIPs (gitignored; published via CI)
 └── docs/
     ├── index.md                       # Map of Content - navigation index for the whole repo
     ├── testing-a-branch-locally.md    # Runbook: test an unmerged branch as a real plugin
-    ├── superpowers/
-    │   └── README.md                  # Design history: plans + specs behind the skills
-    ├── example-doc-graph.svg          # Real /assess doc-navigability SVG, before the action sweep (README hero)
-    ├── example-doc-graph-after.svg    # Same repo, doc-navigability after the action sweep
-    ├── example-heatmap.svg            # Real /assess complexity heatmap, before the action sweep (README hero)
-    ├── example-heatmap-after.svg      # Same repo, complexity heatmap after the action sweep
-    ├── example-heatmap-ktor.svg       # /assess heatmap of ktor (Kotlin), 5.5/8 - public-repo gallery
-    ├── example-heatmap-llamacpp.svg   # /assess heatmap of llama.cpp (C/C++), 4.0/8 - public-repo gallery
-    └── example-heatmap-candle.svg     # /assess heatmap of candle (Rust), 2.5/8 - public-repo gallery
+    ├── floor-anchor-proof.md          # Why the floor checks cannot be silently disarmed
+    ├── superpowers/                   # Design history: plans/ + specs/ behind the skills
+    ├── design/                        # Modernization programme specs
+    ├── huddle-explainer/              # Narrated skill explainer pipeline
+    └── example-*.svg                  # Real /assess heatmaps and doc graphs (README hero and gallery)
 ```
 
-Each subtree has a base doc that the [Map of Content](docs/index.md) links to: [`agents/README.md`](agents/README.md), [`commands/README.md`](commands/README.md), and [`skills/README.md`](skills/README.md).
+The [Map of Content](docs/index.md) links each subtree's entry doc: [`skills/README.md`](skills/README.md) for skills, and its own [Agents](docs/index.md#agents) section for `agents/`, which holds no README because Claude Code would load one as an agent.
 
 ## Contributors
 

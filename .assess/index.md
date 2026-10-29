@@ -1,33 +1,41 @@
-<!-- assess:run_id=20260919114544-b4104782 artifact_schema_version=1.1.0 -->
+<!-- assess:run_id=20261011125246-0d249381 artifact_schema_version=1.4.0 -->
 # Assess Wiki Index
 
-_Last updated: 2026-09-19_
+_Last updated: 2026-10-11_
 
 Catalog of every hotspot ever flagged by `/assess` in this repo. Status reflects the most recent run.
 
 | File | First Flagged | Last Seen | Status | Latest CCN | Latest LOC |
 |------|---------------|-----------|--------|------------|------------|
-| `skills/assess/scripts/assess_core.py` | 2026-05-31 | 2026-09-19 | regressed | 234.0 | 1020 |
-| `skills/assess/tests/test_assess_core.py` | 2026-05-31 | 2026-09-19 | regressed | 200.0 | 1644 |
-| `skills/assess/scripts/complexity-treemap.py` | 2026-05-31 | 2026-09-19 | regressed | 199.0 | 788 |
-| `skills/assess/scripts/lib/doc_graph.py` | 2026-05-31 | 2026-09-19 | regressed | 291.0 | 851 |
-| `skills/assess/scripts/lib/keyhole_signals.py` | 2026-06-01 | 2026-09-19 | regressed | 233.0 | 759 |
-| `skills/assess/tests/test_keyhole_signals.py` | 2026-06-19 | 2026-09-19 | regressed | 159.0 | 895 |
-| `skills/assess/scripts/doc-graph-svg.py` | 2026-05-31 | 2026-09-19 | regressed | 105.0 | 407 |
-| `scripts/floor_anchor.py` | 2026-09-19 | 2026-09-19 | new | 188.0 | 646 |
-| `skills/assess/scripts/lib/doc_staleness.py` | 2026-05-31 | 2026-09-19 | regressed | 90.0 | 335 |
-| `skills/assess/tests/test_complexity_treemap.py` | 2026-09-19 | 2026-09-19 | new | 130.0 | 934 |
+| `skills/assess/scripts/complexity-treemap.py` | 2026-05-31 | 2026-10-11 | persistent | 214.0 | 847 |
+| `skills/assess/scripts/lib/keyhole_signals.py` | 2026-06-01 | 2026-10-11 | persistent | 247.0 | 860 |
+| `skills/assess/scripts/assess_core.py` | 2026-05-31 | 2026-10-11 | persistent | 26.0 | 397 |
+| `skills/assess/scripts/lib/doc_graph.py` | 2026-05-31 | 2026-10-11 | persistent | 209.0 | 705 |
+| `skills/assess/tests/test_complexity_treemap.py` | 2026-09-19 | 2026-10-11 | persistent | 189.0 | 1227 |
+| `skills/assess/scripts/lib/wiki_writer.py` | 2026-10-07 | 2026-10-11 | persistent | 170.0 | 534 |
+| `skills/assess/tests/test_assess_core.py` | 2026-05-31 | 2026-10-11 | persistent | 62.0 | 518 |
+| `skills/assess/scripts/assess_finalize.py` | 2026-10-08 | 2026-10-11 | persistent | 144.0 | 424 |
+| `skills/assess/scripts/lib/doc_staleness.py` | 2026-05-31 | 2026-10-11 | persistent | 119.0 | 499 |
+| `scripts/floor_anchor.py` | 2026-09-19 | 2026-10-11 | persistent | 188.0 | 646 |
+| `skills/assess/tests/test_keyhole_signals.py` | 2026-06-19 | 2026-10-08 | retired - file deleted | - | - |
+| `skills/assess/scripts/doc-graph-svg.py` | 2026-05-31 | 2026-10-07 | graduated | - | - |
 | `skills/assess/scripts/lib/liveness_scan.py` | 2026-05-31 | 2026-09-19 | graduated | - | - |
 | `skills/assess/scripts/lib/change_coupling.py` | 2026-06-01 | 2026-09-19 | graduated | - | - |
+| `scripts/transform_skill.py` | 2026-06-04 | 2026-06-04 | graduated | 44.0 | 165 |
+| `skills/assess/scripts/lib/agent_instructions_grader.py` | 2026-05-31 | 2026-06-04 | graduated | 70.0 | 260 |
+| `skills/assess/tests/test_doc_graph.py` | 2026-05-31 | 2026-06-01 | graduated | 52.0 | 270 |
+| `skills/assess/tests/test_test_pressure.py` | 2026-05-31 | 2026-06-01 | graduated | 79.0 | 384 |
 
 ## Legend
 
 - **active** - in the latest top hotspots list
 - **new** - newly entered the hotspot list this run
 - **graduated** - was a hotspot, no longer is (good)
-- **regressed** - still a hotspot, and getting worse
+- **regressed** - still a hotspot, and getting worse. Any of: its worst function rose; its summed complexity rose by more than the worst function fell (an aggregate rise larger than the worst-function fall); or the worst function is flat or unmeasured and the sum or churn rose
+- **restructured** - still a hotspot; the sum or churn rose but the worst function fell by at least as much as the sum rose, the shape a split into named helpers leaves (good)
 - **persistent** - still a hotspot, roughly unchanged
+- **retired** - the source file was deleted or excluded; the page is kept for history
 
 ## How this gets updated
 
-Each `/assess` run reads this file, the prior `complexity-stats.json`, and the latest run output, then rewrites this index. Per-file detail lives in `hotspots/<slug>.md`. Run history lives in `log.md`.
+Each `/assess` run reads this file, the prior `complexity-stats.json`, and the latest run output, then rewrites this index. A file the latest run did not rank keeps its last known row, so no hotspot drops out of the catalog. Per-file detail lives in `hotspots/<slug>.md`. Run history lives in `log.md`.

@@ -68,3 +68,107 @@
 
 ---
 <!-- chain:a6e1017927b7a96a -->
+<!-- assess:run_id=20261007120131-f520a0c5 artifact_schema_version=1.3.0 -->
+## 2026-10-07 (v1.92.0, run f520a0c5)
+
+- **Files scored:** 172
+- **AI Readiness:** 5.5 / 8 (Solid)
+- **Instructions grade:** A
+- **Hotspot transitions:** 1 graduated, 7 regressed, 1 new, 2 persistent
+- **Top action:** Give each stale suppression in skills/assess/scripts/lib/doc_graph.py a stated reason or remove it
+
+[Full report](./assess-report.md)
+
+---
+<!-- chain:91c10d55d1a1e66c -->
+<!-- assess:run_id=20261007185833-e950cb1b artifact_schema_version=1.3.0 -->
+## 2026-10-07 (v1.92.6, run e950cb1b)
+
+- **Files scored:** 172
+- **AI Readiness:** 6.0 / 8 (Solid)
+- **Instructions grade:** A
+- **Hotspot transitions:** 0 graduated, 7 regressed, 0 new, 3 persistent
+- **Top action:** Decide how FLOOR.md clause iii and floor_core_changed agree, then add the clause-derived floor tests (#410)
+
+[Full report](./assess-report.md)
+
+---
+<!-- chain:2e10d3785b44fd79 -->
+<!-- assess:run_id=20261007204013-4ace52ea artifact_schema_version=1.3.0 -->
+## 2026-10-07 (v1.92.7, run 4ace52ea)
+
+- **Files scored:** 176
+- **AI Readiness:** 6.0 / 8 (Solid)
+- **Instructions grade:** A
+- **Hotspot transitions:** 1 graduated, 3 regressed, 0 restructured, 1 new, 6 persistent
+- **Top action:** Decide how FLOOR.md clause iii and floor_core_changed agree, then add the clause-derived floor tests (#410)
+
+[Full report](./assess-report.md)
+
+---
+<!-- chain:3287cc08dc4b7312 -->
+<!-- assess:run_id=20261008085555-417634ee artifact_schema_version=1.3.0 -->
+## 2026-10-08 (v1.92.8, run 417634ee)
+
+- **Files scored:** 184
+- **AI Readiness:** 7.0 / 8 (AI-Native)
+- **Instructions grade:** A
+- **Hotspot transitions:** 1 graduated, 1 regressed, 0 restructured, 1 new, 8 persistent
+- **Top action:** Decide how FLOOR.md clause iii and floor_core_changed agree, then pin floor_anchor.py behaviour with clause-derived tests (#410; 43% mutant survival)
+
+[Full report](./assess-report.md)
+
+---
+<!-- chain:981698290f9d2107 -->
+<!-- assess:run_id=20261008133519-d0c68d2e artifact_schema_version=1.3.0 -->
+## 2026-10-08 (v1.93.0, run d0c68d2e)
+
+- **Files scored:** 215
+- **AI Readiness:** 7.0 / 8 (AI-Native)
+- **Instructions grade:** A
+- **Hotspot transitions:** 1 graduated, 0 regressed, 0 restructured, 1 new, 9 persistent
+- **Top action:** Strengthen scripts/floor_anchor.py tests from FLOOR.md clause text once #410 decides clause iii
+
+[Full report](./assess-report.md)
+
+---
+<!-- chain:93a4b7b505a3c8e0 -->
+<!-- assess:run_id=20261008155039-de900b5c artifact_schema_version=1.3.0 -->
+## 2026-10-08 (v1.94.0, run de900b5c)
+
+- **Files scored:** 219
+- **AI Readiness:** 7.5 / 8 (AI-Native)
+- **Instructions grade:** A
+- **Hotspot transitions:** 0 graduated, 0 regressed, 0 restructured, 0 new, 10 persistent
+- **Top action:** Strengthen scripts/floor_anchor.py tests from FLOOR.md clause text once #410 decides clause iii
+
+[Full report](./assess-report.md)
+
+---
+<!-- chain:1ffdd05141b67401 -->
+<!-- assess:run_id=20261008175925-32cb78d4 artifact_schema_version=1.3.0 -->
+## 2026-10-08 (v1.95.0, run 32cb78d4)
+
+- **Files scored:** 224
+- **AI Readiness:** 7.5 / 8 (AI-Native)
+- **Instructions grade:** A
+- **Hotspot transitions:** 0 graduated, 0 regressed, 0 restructured, 0 new, 10 persistent
+- **Top action:** Strengthen scripts/floor_anchor.py tests from FLOOR.md clause text once #410 decides clause iii
+
+[Full report](./assess-report.md)
+
+---
+<!-- chain:5fc603afefd3a63b -->
+<!-- assess:run_id=20261011125246-0d249381 artifact_schema_version=1.4.0 -->
+## 2026-10-11 (v1.96.0, run 0d249381)
+
+- **Files scored:** 244
+- **AI Readiness:** 7.5 / 8 (AI-Native)
+- **Instructions grade:** A
+- **Hotspot transitions:** 0 graduated, 0 regressed, 0 restructured, 0 new, 10 persistent
+- **Top action:** Strengthen scripts/floor_anchor.py's tests to pin observable behaviour, written from FLOOR.md's clause text, once the #410 decision on clause iii is made
+
+[Full report](./assess-report.md)
+
+---
+<!-- chain:08dc3a03e8e5e473 -->

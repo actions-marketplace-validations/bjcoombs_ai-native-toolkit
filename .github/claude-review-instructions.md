@@ -7,9 +7,9 @@ workflow substitutes `{REPO}`, `{PR_NUMBER}`, `{HEAD_SHA}`, `{REPO_OWNER}`,
 ## Project
 
 `ai-native-toolkit` is a **Claude Code plugin**. The deliverable is markdown:
-skills (`skills/<name>/SKILL.md`), commands (`commands/*.md`), and agents
-(`agents/*.md`). The only runtime code is the Python **`/assess` deterministic
-core** under `skills/assess/scripts/` (with `lib/`) plus the standalone-skill
+skills (`skills/<name>/SKILL.md`, including the user-invoked slash-command
+workflows) and agents (`agents/*.md`). The only runtime code is the Python
+**`/assess` deterministic core** under `skills/assess/scripts/` (with `lib/`) plus the standalone-skill
 build pipeline under `scripts/`. It is a **public** repo.
 
 The product's own thesis is **truth-pressure**: honest, navigable docs and
@@ -34,16 +34,19 @@ clean.
 ### 1. Plugin contract invariants
 The `plugin contract pytest` job encodes these, but catch them in review too:
 - **SKILL.md frontmatter**: `name` must match the directory; `description`
-  **must contain a `TRIGGER` clause** (the skill router matches on it).
+  **must contain a `TRIGGER` clause** (the skill router matches on it), except
+  in a user-invoked skill (`disable-model-invocation: true`), which must not
+  carry one.
 - **No placeholder tokens** (`TODO`, `TKTK`, `FIXME`, `{PLACEHOLDER}`) outside
-  code fences in any shipped `SKILL.md` / command file.
+  code fences in any shipped `SKILL.md`.
 - **Internal links resolve**: a relative markdown link `[x](./path)` must point
   to a real file. For illustrative file mentions use inline code (`` `CLAUDE.md` ``),
   never a clickable relative link - a dead link fails CI.
 - **marketplace / agents**: every plugin in `.claude-plugin/marketplace.json`
-  exists on disk; any agent a command names has an `agents/<name>.md`; agent
-  frontmatter has `name` (matches filename), `description`, `model`, and a
-  `color` from the allowed set.
+  exists on disk; any agent a skill names has an `agents/<name>.md`; every `.md`
+  under `agents/` is an agent (no README or other doc there: Claude Code loads
+  each one as an agent); agent frontmatter has `name` (matches filename),
+  `description`, `model`, and a `color` from the allowed set.
 
 ### 2. Versioning discipline
 Did the PR bump `.claude-plugin/plugin.json` `.version`? Substantive PRs must,
@@ -66,9 +69,11 @@ Flag unmarked plugin-only content.
 ### 4. Deterministic-core boundary (`/assess`)
 The `lib/` core does all data/math with **no AI**, and reaches the network only
 through `lib/gh_cli.py` (optional live GitHub reads via the `gh` CLI that resolve the
-remote first and degrade to `available: false`); the LLM only writes prose via the
-`assess_finalize.py` write-back. Flag:
-- AI calls, nondeterminism, or network access outside `lib/gh_cli.py` creeping into
+remote first and degrade to `available: false`) and the opt-in mutation pass's uv
+runner in `lib/test_pressure/mutmut3.py` (`uv run --project` in a scratch copy, which
+may download the assessed package's dependencies plus the pinned mutmut and pytest
+on first use); the LLM only writes prose via the `assess_finalize.py` write-back. Flag:
+- AI calls, nondeterminism, or network access outside those two paths creeping into
   `skills/assess/scripts/lib/`, and any `gh_cli` caller that reports a clean result
   when a read failed.
 - A change to a deterministic module **without a matching test** in
@@ -78,8 +83,10 @@ remote first and degrade to `available: false`); the LLM only writes prose via t
   means "no instruction file found anywhere" - different remediation from `F`).
 
 ### 5. Python quality gates
-Ruff enforces mccabe `max-complexity = 15`; mypy gates `lib/`. Flag new
-functions likely over the complexity threshold, new untyped public functions,
+Ruff enforces mccabe `max-complexity = 15`; mypy runs `strict` over all of
+`skills/assess/scripts/` and the non-floor `scripts/` modules, so an untyped
+function already fails the gate. Flag new functions likely over the complexity
+threshold, new `Any` where the shape is known (prefer a `TypedDict`),
 and any `# noqa` / `# type: ignore` added **without a one-line justification**.
 Prefer the "types over tests" fix (schema/type) over a runtime guard.
 
@@ -123,7 +130,8 @@ This runs in parallel with CI. Check it and note it in your summary; don't block
 gh pr checks {PR_NUMBER}
 ```
 Required (merge-gating) checks are `skills/assess pytest`, `scripts/ pytest`,
-`plugin contract pytest`, `Validate PR title`. `CodeRabbit`, `Auto-label`, and
+`plugin contract pytest`, `ruff + mypy gates`, `Validate PR title`,
+`floor enforcement` and `floor self-anchor`. `CodeRabbit`, `Auto-label`, and
 `build` are non-blocking.
 
 ## Bot comment gate (CodeRabbit)

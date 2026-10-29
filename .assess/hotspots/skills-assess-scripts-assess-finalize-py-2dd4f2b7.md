@@ -1,0 +1,34 @@
+<!-- assess:run_id=20261011125246-0d249381 artifact_schema_version=1.4.0 -->
+# Hotspot: `skills/assess/scripts/assess_finalize.py`
+
+_First flagged: 2026-10-08. Last seen: 2026-10-11. Status: persistent._
+
+## Current metrics
+
+| Metric | Value |
+|--------|-------|
+| LOC | 424 |
+| Cyclomatic complexity (file aggregate) | 144 |
+| Worst function | `_validate_evidence` (11) |
+| Commits in churn window | 16 |
+| Has test file | yes |
+
+## History across runs
+
+| Run date | Run | LOC | CCN | Commits | Status |
+|----------|-----|-----|-----|---------|--------|
+| 2026-10-08 | 417634ee | 439 | 148 | 13 | new |
+| 2026-10-08 | d0c68d2e | 425 | 144 | 15 | persistent |
+| 2026-10-08 | de900b5c | 424 | 144 | 16 | persistent |
+| 2026-10-08 | 32cb78d4 | 424 | 144 | 16 | persistent |
+| 2026-10-11 | 0d249381 | 424 | 144 | 16 | persistent |
+
+## Briefing for editing this file
+
+Use this briefing when about to modify `skills/assess/scripts/assess_finalize.py`:
+
+Hotspot (persistent). 424 LOC, aggregate cyclomatic complexity 144 (worst function `_validate_evidence` 11), 16 commits in churn window. (Briefing refined by LLM via assess_finalize - see Suggested actions below.)
+
+## Suggested actions
+
+This file is flagged but outside this run's Top 3. See the report's Top 3 Actions, or run a focused /assess pass for file-specific guidance.

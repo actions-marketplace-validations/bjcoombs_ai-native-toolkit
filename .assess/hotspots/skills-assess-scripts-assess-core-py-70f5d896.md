@@ -1,31 +1,38 @@
-<!-- assess:run_id=20260919114544-b4104782 artifact_schema_version=1.1.0 -->
+<!-- assess:run_id=20261011125246-0d249381 artifact_schema_version=1.4.0 -->
 # Hotspot: `skills/assess/scripts/assess_core.py`
 
-_First flagged: 2026-05-31. Last seen: 2026-09-19. Status: regressed._
+_First flagged: 2026-05-31. Last seen: 2026-10-11. Status: persistent._
 
 ## Current metrics
 
 | Metric | Value |
 |--------|-------|
-| LOC | 1020 |
-| Cyclomatic complexity (file max) | 234.0 |
-| Commits in churn window | 57 |
+| LOC | 397 |
+| Cyclomatic complexity (file aggregate) | 26 |
+| Worst function | `build_run_context` (13) |
+| Commits in churn window | 70 |
 | Has test file | yes |
 
 ## History across runs
 
-| Run date | LOC | CCN | Commits | Status |
-|----------|-----|-----|---------|--------|
-| 2026-09-19 | 1020 | 234.0 | 57 | regressed |
+| Run date | Run | LOC | CCN | Commits | Status |
+|----------|-----|-----|-----|---------|--------|
+| 2026-09-19 | - | 1020 | 234.0 | 57 | regressed |
+| 2026-10-07 | f520a0c5 | 1027 | 238 | 61 | regressed |
+| 2026-10-07 | e950cb1b | 1089 | 249 | 62 | regressed |
+| 2026-10-07 | 4ace52ea | 1093 | 251 | 63 | regressed |
+| 2026-10-08 | 417634ee | 1097 | 251 | 65 | persistent |
+| 2026-10-08 | d0c68d2e | 394 | 26 | 67 | persistent |
+| 2026-10-08 | de900b5c | 394 | 26 | 68 | persistent |
+| 2026-10-08 | 32cb78d4 | 397 | 26 | 69 | persistent |
+| 2026-10-11 | 0d249381 | 397 | 26 | 70 | persistent |
 
 ## Briefing for editing this file
 
 Use this briefing when about to modify `skills/assess/scripts/assess_core.py`:
 
-Hotspot (regressed). 1020 LOC, max cyclomatic complexity 234.0, 57 commits in churn window. Carries 3 stale promissory marker(s) (suppression, todo; oldest survived 54 edits to this file). (Briefing refined by LLM via assess_finalize - see Suggested actions below.)
+Hotspot (persistent). 397 LOC, aggregate cyclomatic complexity 26 (worst function `build_run_context` 13), 70 commits in churn window. (Briefing refined by LLM via assess_finalize - see Suggested actions below.)
 
 ## Suggested actions
 
-- build_run_context sits at mccabe 15 of 15: extract a block before adding the next signal
-- Record a credited reason on the line-879 noqa BLE001 (survived 36 edits)
-
+This file is flagged but outside this run's Top 3. See the report's Top 3 Actions, or run a focused /assess pass for file-specific guidance.

@@ -29,15 +29,19 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
+from lib.agent_environment import scan_agent_environment
+from lib.agent_harness import scan_agent_harness
 from lib.agent_ops import scan_agent_ops
+from lib.claude_config import scan_claude_config
 from lib.config_drift import scan_config_drift
 from lib.gate_cost import estimate_gate_cost
 from lib.instruction_claims import scan_instruction_claims
+from lib.instruction_files import nested_instruction_surface
 from lib.review_reality import scan_review_reality
 
 # Names the core passes to ``run_scans``. A spec may read these, or the key of
 # any spec declared before it.
-PROVIDED_INPUTS = frozenset({"repo_root", "instruction_files"})
+PROVIDED_INPUTS = frozenset({"repo_root", "instruction_files", "scope", "excludes"})
 
 STAGE_READ_SIDE = "read_side"
 STAGE_POST_OFFERS = "post_offers"
@@ -183,6 +187,42 @@ SCANS: tuple[ScanSpec, ...] = (
     ScanSpec(
         "instruction_claims", scan_instruction_claims,
         ("repo_root", "instruction_files"), STAGE_POST_OFFERS,
+    ),
+    # Claude Code configuration (Layer 0): legacy command files and skill,
+    # command and agent frontmatter the runtime silently ignores, checked
+    # against the documented field sets pinned in lib/claude_config_fields.py.
+    # available: false when the run root has no .claude/ and no plugin
+    # manifest. Last in the table so every earlier key keeps its position.
+    ScanSpec(
+        "claude_config", scan_claude_config,
+        ("repo_root", "scope", "excludes"), STAGE_POST_OFFERS,
+    ),
+    # Nested and path-scoped instruction files (Layer 0, issue #511): nested
+    # CLAUDE.md / AGENTS.md / GEMINI.md, .claude/rules, Copilot and Cursor
+    # rules, each graded with its scope; the always-loaded budget per tool;
+    # and dead scope globs, ignored .cursor .md files, a CLAUDE.md shadowing a
+    # different AGENTS.md, and nested files that repeat their parent.
+    ScanSpec(
+        "nested_instructions", nested_instruction_surface,
+        ("repo_root", "excludes"), STAGE_POST_OFFERS,
+    ),
+    # Committed agent harness (informational): what the repo's agent config
+    # runs on every session (settings and frontmatter hooks, env, apiKeyHelper,
+    # .mcp.json, .cursor/hooks.json) and the settings that expose a secret or
+    # widen it (tracked settings.local.json or .env, broad Bash allow, hidden
+    # Unicode, credential mounts, comment-triggered deploys). Issue #513.
+    ScanSpec(
+        "agent_harness", scan_agent_harness,
+        ("repo_root", "scope", "excludes"), STAGE_POST_OFFERS,
+    ),
+    # Agent working environment (Layer 5, issue #514): committed setup
+    # (copilot-setup-steps.yml, devcontainer, Cursor environment, SessionStart
+    # hook, setup script or target), the check command a graded instruction file
+    # names, lockfiles per manifest, the Layer 5 Partial cap, and the optional
+    # `gh` CI-duration probe. Reads agent_harness for the SessionStart hooks.
+    ScanSpec(
+        "agent_environment", scan_agent_environment,
+        ("repo_root", "instruction_files", "agent_harness", "excludes"), STAGE_POST_OFFERS,
     ),
 )
 
